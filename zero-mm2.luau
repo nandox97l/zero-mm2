@@ -28,7 +28,7 @@ local app: any = {
     stats = { frames = 0, aim_moves = 0, silent_calls = 0, collected_events = 0, collected = 0 },
     settings = {
         esp = false, boxes = true, names = true, chams = true, lobby = false,
-        gun_esp = false, coin_esp = false, aim = false, silent = false,
+        skeleton = false, trigger = false, gun_esp = false, coin_esp = false, aim = false, silent = false,
         fov_circle = false, fov = 180, smoothing = 8, prediction = 0,
         wall_check = true, target_mode = "By role", target_part = "HumanoidRootPart",
         farm = false, farm_mode = "Normal", farm_speed = 14,
@@ -288,7 +288,7 @@ for _, key in ipairs({"GetMouseTargetCFrame", "GetTargetPosition"}) do
     if type(original) ~= "function" then app.module_ready.weapon = false else
     local wrapper = function(self, ...)
         if app.alive and equipped_weapon() and (app.finish_active or (app.settings.silent and math.random(1, 100) <= app.settings.hit_chance)) then
-            local target = app.finish_active and app.forced_target or app.select_target()
+            local target = app.finish_active and app.forced_target or (app.trigger_target and os.clock() < app.trigger_until and app.trigger_target) or app.select_target()
             if target and not active_player(target.player) then target = nil end
             if target then
                 app.stats.silent_calls += 1
@@ -313,6 +313,43 @@ for _ = 1, 24 do
         Color = Color3.fromRGB(255, 183, 80), Visible = false}))
 end
 
+local rigs = {
+    R15 = {{"Head","UpperTorso"},{"UpperTorso","LowerTorso"}},
+    R6 = {{"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"}},
+}
+for _, side in ipairs({"Left", "Right"}) do
+    for _, chain in ipairs({{"UpperTorso","UpperArm","LowerArm","Hand"},{"LowerTorso","UpperLeg","LowerLeg","Foot"}}) do
+        local parent = chain[1]
+        for i = 2, #chain do
+            local child = side .. chain[i]
+            table.insert(rigs.R15,{parent,child})
+            parent = child
+        end
+    end
+end
+local function skeleton_step(visual, character, camera, enabled, color)
+    if not enabled and not visual.bones then return end
+    visual.bones = visual.bones or {}
+    local links = enabled and (character:FindFirstChild("UpperTorso") and rigs.R15 or rigs.R6) or {}
+    for i = 1, math.max(#links, #visual.bones) do
+        local line = visual.bones[i]
+        if not line then line = draw("Line",{Visible=false, Transparency=1}); visual.bones[i]=line end
+        line.Visible = false
+        local link=links[i]
+        if link then
+            local a,b=character:FindFirstChild(link[1]),character:FindFirstChild(link[2])
+            if a and b then
+                local u,visibleA=camera:WorldToViewportPoint(a.Position)
+                local v,visibleB=camera:WorldToViewportPoint(b.Position)
+                if visibleA and visibleB then
+                    line.From,line.To=Vector2.new(u.X,u.Y),Vector2.new(v.X,v.Y)
+                    line.Color,line.Thickness,line.Visible=color,app.settings.line_thickness,true
+                end
+            end
+        end
+    end
+end
+
 local function add_player(player)
     if player == local_player or app.visuals[player] then return end
     local highlight = Instance.new("Highlight")
@@ -335,7 +372,9 @@ connect(Players.PlayerRemoving, function(player)
     local visual = app.visuals[player]
     if visual then
         visual.highlight:Destroy()
-        for _, object in ipairs({visual.box, visual.text, visual.tracer}) do
+        local handles = visual.bones or {}
+        table.insert(handles,visual.box); table.insert(handles,visual.text); table.insert(handles,visual.tracer)
+        for _, object in ipairs(handles) do
             object:Remove()
             local index = table.find(app.drawings, object)
             if index then table.remove(app.drawings, index) end
@@ -402,6 +441,7 @@ end)
 local ProfileData = app.load_module(modules, "ProfileData", "profile", {Materials = {Owned = {}}})
 local Sync = app.load_module(ReplicatedStorage:FindFirstChild("Database"), "Sync", "catalog", {NewShop = {}, MysteryBox = {}, Item = {}})
 local movement_originals = {}
+local underground_return = nil
 local motion = {root = nil, expected = nil, paused_until = 0, corrections = 0, owner = nil}
 local fling_state = nil
 app.stats.corrections = 0
@@ -437,6 +477,11 @@ local function restore_property(object, key)
 end
 
 function app.restore_movement()
+    local saved = underground_return
+    underground_return = nil
+    if saved and saved.root.Parent == local_player.Character and saved.floor:IsDescendantOf(workspace) then
+        saved.root.CFrame = saved.floor.CFrame * saved.offset
+    end
     if app.flight_force then app.flight_force:Destroy(); app.flight_force = nil end
     if fling_state and fling_state.root.Parent and local_player.Character and fling_state.root == local_player.Character:FindFirstChild("HumanoidRootPart") then
         fling_state.root.CFrame = fling_state.origin
@@ -461,7 +506,7 @@ end
 
 function app.stop_all()
     app.finish_active, app.pickup_requested, app.box_running, app.troll_fling_active = false, false, false, false
-    for _, key in ipairs({"esp", "gun_esp", "coin_esp", "aim", "silent", "farm", "xp_farm",
+    for _, key in ipairs({"esp", "gun_esp", "coin_esp", "aim", "silent", "trigger", "farm", "xp_farm",
         "flight", "noclip", "speed_enabled", "jump_enabled", "auto_gun", "infinite_jump",
         "troll_follow", "troll_orbit", "troll_spin", "troll_spectate", "troll_rainbow", "skins"}) do
         set_enabled(key, false)
@@ -506,6 +551,18 @@ local function move_to(destination, dt, owner, teleport, underground)
         end
         return false
     end
+    if underground and not underground_return then
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {character}
+        params.RespectCanCollide = true
+        local hit = workspace:Raycast(root.Position + Vector3.yAxis * 2, -Vector3.yAxis * 40, params)
+        if not hit or not hit.Instance:IsA("BasePart") then return false end
+        local standing = CFrame.new(hit.Position + Vector3.yAxis * (math.max(humanoid.HipHeight, 2) + root.Size.Y/2 + 0.2))
+        underground_return = {root=root, floor=hit.Instance, offset=hit.Instance.CFrame:ToObjectSpace(standing)}
+    elseif underground_return and not underground then
+        app.restore_movement()
+    end
     noclip_character(character)
     remember_property(humanoid, "AutoRotate", false)
     remember_property(humanoid, "PlatformStand", true)
@@ -535,22 +592,52 @@ local function pickup_step(dt)
     local part = gun_part()
     if not part then app.farm_status = "Waiting for dropped gun"; return false end
     local _, root = character_parts(local_player)
-    if not root or (root.Position - part.Position).Magnitude > app.settings.max_distance then return false end
+    if not root then return false end
     app.farm_status = "Picking up gun"
-    if move_to(part.Position + Vector3.new(0, 1, 0), dt, "gun", false, false) and os.clock() - app.last_touch > 0.4 then
+    if os.clock() - app.last_touch >= 0.45 then
+        app.restore_movement()
+        root.CFrame = CFrame.new(part.Position + Vector3.yAxis * 0.5) * root.CFrame.Rotation
+        root.AssemblyLinearVelocity = Vector3.zero
         app.last_touch = os.clock()
-        firetouchinterest(root, part, 1)
         firetouchinterest(root, part, 0)
+        firetouchinterest(root, part, 1)
     end
     return true
 end
 
-function app.request_finish()
+function app.request_finish(murder_only)
+    if murder_only and player_role(local_player) ~= "Murderer" then return false, "Murderer role required" end
+    app.finish_murder_only = murder_only == true
     if not active_player(local_player) then return false, "No active round" end
     app.finish_active = true
     app.finish_started = os.clock()
     app.finish_target_seen = false
     return true
+end
+
+local function launch_direction(map, root, bounds, half)
+    local pos = bounds:PointToObjectSpace(root.Position)
+    local filter = RaycastParams.new()
+    filter.FilterType = Enum.RaycastFilterType.Include
+    filter.FilterDescendantsInstances = {map}
+    filter.RespectCanCollide = true
+    local best, score = Vector3.yAxis, -math.huge
+    -- Prefer an unobstructed exit; in rooms pick the longest unobstructed run.
+    for i=0,16 do
+        local angle = i * math.pi/4
+        local vertical = i < 8 and 0.25 or 1
+        local localDir = i == 16 and Vector3.yAxis or Vector3.new(math.cos(angle),vertical,math.sin(angle)).Unit
+        local function to_edge(p, d, h)
+            if math.abs(d)<0.001 then return math.huge end
+            return ((d>0 and h or -h)-p)/d
+        end
+        local distance=math.max(4,math.min(to_edge(pos.X,localDir.X,half.X),to_edge(pos.Y,localDir.Y,half.Y),to_edge(pos.Z,localDir.Z,half.Z))+8)
+        local dir=bounds:VectorToWorldSpace(localDir)
+        local hit=workspace:Raycast(root.Position,dir*distance,filter)
+        local rating=hit and hit.Distance or 10000-distance
+        if rating>score then best,score=dir,rating end
+    end
+    return best
 end
 
 local function fling_step(target, dt)
@@ -571,6 +658,21 @@ local function fling_step(target, dt)
         local offset = target_root.Position - root.Position
         local horizontal = Vector3.new(offset.X, 0, offset.Z)
         fling_state.heading = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.xAxis
+        local map
+        for _,candidate in ipairs(workspace:GetChildren()) do
+            if candidate:IsA("Model") and candidate:FindFirstChild("CoinContainer") then map=candidate;break end
+        end
+        if map then
+            local bounds, size = map:GetBoundingBox()
+            local localPos = bounds:PointToObjectSpace(target_root.Position)
+            if math.abs(localPos.X) <= size.X/2 and math.abs(localPos.Z) <= size.Z/2 and math.abs(localPos.Y) <= size.Y/2+10 then
+                fling_state.bounds, fling_state.extents = bounds, size/2
+                fling_state.map = map
+                fling_state.exit = launch_direction(map,target_root,bounds,size/2)
+                fling_state.next_scan = os.clock()+0.4
+            end
+        end
+        app.stats.fling_outside_map = false
         fling_state.target = target_root
         fling_state.strikes = 0
         app.stats.last_fling_strikes = 0
@@ -587,7 +689,14 @@ local function fling_step(target, dt)
     app.stats.last_fling_displacement = (target_root.Position - fling_state.target_origin).Magnitude
     app.stats.last_fling_vertical = target_root.Position.Y - fling_state.target_origin.Y
     app.farm_status = "Fling: " .. target.DisplayName
-    if elapsed > 6 or (target_root.Position - fling_state.target_origin).Magnitude > 150 then
+    local outside = false
+    if fling_state.bounds then
+        local pos = fling_state.bounds:PointToObjectSpace(target_root.Position)
+        local extents = fling_state.extents
+        outside = math.abs(pos.X)>extents.X+5 or math.abs(pos.Z)>extents.Z+5 or math.abs(pos.Y)>extents.Y+5
+    end
+    app.stats.fling_outside_map = outside
+    if elapsed > 6 or outside or (not fling_state.bounds and (target_root.Position-fling_state.target_origin).Magnitude>150) then
         app.stats.last_fling_displacement = (target_root.Position - fling_state.target_origin).Magnitude
         app.restore_movement()
         app.finish_active, app.troll_fling_active = false, false
@@ -603,10 +712,18 @@ connect(RunService.PreSimulation, function(dt)
     local root, target = state.root, state.target
     local velocity = target.AssemblyLinearVelocity
     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
-    local heading = horizontal.Magnitude > 4 and horizontal.Unit or state.heading
+    local heading = not state.bounds and horizontal.Magnitude > 4 and horizontal.Unit or state.heading
     local side = Vector3.new(-heading.Z, 0, heading.X)
-    local direction = (heading + side * (math.sin(state.strikes * 0.38) * 0.18) + Vector3.yAxis * 0.52).Unit
-    local speed = 720
+    local direction = (heading + side * (math.sin(state.strikes * 0.38) * 0.12) + Vector3.yAxis * 0.8).Unit
+    if state.map and state.map.Parent then
+        if os.clock() >= state.next_scan then
+            state.exit = launch_direction(state.map,target,state.bounds,state.extents)
+            state.next_scan = os.clock()+0.4
+        end
+        direction = state.exit
+        if math.abs(direction.Y)>0.9 then side = Vector3.xAxis end
+    end
+    local speed = 2600
     local travel = math.clamp(dt, 1/120, 1/30)
     local lead = velocity * (travel + math.clamp(local_player:GetNetworkPing(), 0, 0.12))
     if lead.Magnitude > 4 then lead = lead.Unit * 4 end
@@ -614,7 +731,7 @@ connect(RunService.PreSimulation, function(dt)
     local start = contact - direction * 0.65
     root.CFrame = CFrame.lookAt(start, contact)
     root.AssemblyLinearVelocity = velocity + direction * speed
-    root.AssemblyAngularVelocity = Vector3.new(0, 65, 0)
+    root.AssemblyAngularVelocity = side * 280 + Vector3.yAxis * 65
     state.strikes += 1
     app.stats.last_fling_strikes = state.strikes
 end)
@@ -636,9 +753,15 @@ local function finish_step(dt)
         app.finish_active = false; app.forced_target = nil; end_motion(); return false
     end
     local role = player_role(local_player)
+    if app.finish_murder_only and role ~= "Murderer" then
+        app.finish_active, app.forced_target = false, nil
+        end_motion()
+        return false
+    end
     local _, root, humanoid = character_parts(local_player)
     local target = murderer()
     if role == "Murderer" then
+        target = nil
         local distance = math.huge
         for _, other in ipairs(Players:GetPlayers()) do
             if other ~= local_player and active_player(other) then
@@ -738,6 +861,7 @@ function app.farm_step(dt)
             if (app.settings.farm_kind == "Todos" or app.settings.farm_kind == kind) and bag.current >= bag.capacity then full = true end
         end
         if full then
+            if underground_return then app.restore_movement() end
             app.farm_status = "Bag full"
             if not app.full_handled then
                 app.full_handled = true
@@ -762,7 +886,10 @@ function app.farm_step(dt)
                     app.last_touch = os.clock()
                     firetouchinterest(root, coin, 1); firetouchinterest(root, coin, 0)
                 end
-            else app.farm_status = "No collectible in range" end
+            else
+                if underground_return then app.restore_movement() end
+                app.farm_status = "No collectible in range"
+            end
         end
     end
     if not used and in_round and app.settings.xp_farm then
@@ -1000,12 +1127,14 @@ local skin_messages = {Gun = "", Knife = ""}
 local catalog_ids = {Gun = {}, Knife = {}}
 local http = game:GetService("HttpService")
 
-local function fetch_skin_model(asset_id)
+local function fetch_skin_model(asset_id, part_name)
     local objects = game:GetObjects("rbxassetid://" .. tostring(asset_id))
     local model
     for _, object in ipairs(objects) do
         if not model then
-            local handle = object:IsA("BasePart") and object or object:FindFirstChild("Handle", true) or object:FindFirstChildWhichIsA("BasePart", true)
+            local handle
+            if part_name then handle = object:FindFirstChild(part_name, true)
+            else handle = object:IsA("BasePart") and object or object:FindFirstChild("Handle", true) or object:FindFirstChildWhichIsA("BasePart", true) end
             if handle and handle:IsA("BasePart") then
                 -- Copy only render geometry from external models, never scripts or constraints.
                 local visual = handle:Clone()
@@ -1029,6 +1158,17 @@ local function store_asset(name, kind)
     if featured[name] then
         local loaded, model = pcall(fetch_skin_model, featured[name])
         if loaded and model then return model end
+    end
+    local pack_names = {
+        "Clockwork","Ice Shard","Blaster","Flames","Eternal III","Chroma Boneblade","Boneblade","Purple Seer","Blue Seer","Seer","Yellow Seer","Red Seer","Gemstone","BattleAxe II","Chroma Gingerblade","Ginger Luger","Eternal II","Winter's Edge","Xmas","BattleAxe","Hallow's Blade","Pumpking","Fang","Frostsaber","Eternal","Orange Seer","Shark","Hallow's Edge","Red Luger","Hand Saw","Chill","Candy","Heat","Snowflake","Tides","Pixel","Gingerblade","Black Seer","Deathshard","Saw","Laser","Virtual","Ice Dragon","Slasher","Spider","Sugar","Old Glory","Luger","Nightblade","Green Luger"
+    }
+    local normalized = name:lower():gsub("[^%w]", "")
+    for _, part_name in ipairs(pack_names) do
+        if part_name:lower():gsub("[^%w]", "") == normalized then
+            local ok, model = pcall(fetch_skin_model, 10993357771, part_name)
+            if ok and model then return model end
+            break
+        end
     end
     local query = http:UrlEncode("MM2 " .. name)
     local url = "https://apis.roblox.com/toolbox-service/v1/"
@@ -1308,6 +1448,26 @@ connect(Players.PlayerAdded, function() app.refresh_targets() end)
 connect(Players.PlayerRemoving, function() task.defer(app.refresh_targets) end)
 
 
+local trigger_params = RaycastParams.new()
+trigger_params.FilterType = Enum.RaycastFilterType.Exclude
+local function trigger_step(camera, cursor)
+    if not app.settings.trigger or app.finish_active or not app.has_focus() or UserInputService:GetFocusedTextBox() then return end
+    local gun = equipped_weapon()
+    if not gun or gun.Name ~= "Gun" or not active_player(local_player) or os.clock()-last_attack < 3.1 then return end
+    trigger_params.FilterDescendantsInstances = {local_player.Character, camera}
+    local ray = camera:ViewportPointToRay(cursor.X, cursor.Y)
+    local hit = workspace:Raycast(ray.Origin,ray.Direction * app.settings.aim_distance,trigger_params)
+    local body = hit and hit.Instance:FindFirstAncestorOfClass("Model")
+    local target = body and Players:GetPlayerFromCharacter(body)
+    if target and eligible_target(target) then
+        app.trigger_target = {player=target,part=hit.Instance}
+        app.trigger_until = os.clock()+0.15
+        last_attack=os.clock()
+        gun:Activate()
+        app.stats.trigger_shots=(app.stats.trigger_shots or 0)+1
+    end
+end
+
 function app.render_step(dt)
     if not app.alive or app.rebuilding then return end
     local camera = workspace.CurrentCamera
@@ -1315,6 +1475,7 @@ function app.render_step(dt)
     app.stats.frames += 1
     app.extra_render(dt)
     local cursor = cursor_position(camera)
+    trigger_step(camera,cursor)
     fov.Color = app.settings.fov_color
     fov.Position = cursor
     fov.Radius = app.settings.fov
@@ -1327,6 +1488,7 @@ function app.render_step(dt)
             and (role ~= "Innocent" or app.settings.show_innocents)
             and (camera.CFrame.Position - root.Position).Magnitude <= app.settings.esp_distance
             and (not app.settings.esp_visible or visible_target(root, camera))
+        skeleton_step(visual,character,camera,show and app.settings.skeleton,colors[role] or colors.Innocent)
         visual.tracer.Visible = false
         visual.box.Visible = false
         visual.text.Visible = false
@@ -1430,6 +1592,7 @@ function app.diagnostics()
 end
 
 local translations = {pt = {
+    ["Skeleton"]="Esqueleto", ["Trigger bot"]="Disparo ao passar a mira", ["Kill all as Murderer"]="Eliminar todos como Murderer", ["Murderer role required"]="É preciso ser o Murderer",
     ["UI library"]="Biblioteca da interface", ["Gun A–Z"]="Pistolas A–Z", ["Knife A–Z"]="Facas A–Z",
     ["Local skins"] = "Skins locais", ["Target player"] = "Jogador alvo", ["Refresh players"] = "Atualizar jogadores",
     ["Follow target"] = "Seguir alvo", ["Orbit target"] = "Orbitar alvo", ["Orbit radius"] = "Raio da orbita",
@@ -1448,7 +1611,7 @@ local translations = {pt = {
     ["Missing APIs"] = "APIs em falta", ["All required APIs available"] = "Todas as APIs necessarias disponiveis",
     ["Unavailable feature"] = "Funcao indisponivel", ["Disabled modules"] = "Modulos indisponiveis",
     ["Disables idle callbacks without clicking or activating weapons."] = "Desativa callbacks de inatividade sem clicar nem ativar armas.",
-    ["Visuals"] = "Visuais", ["Movement"] = "Movimento", ["Boxes"] = "Caixas", ["Settings"] = "Configuracoes", ["About"] = "Sobre",
+    ["Aimbot"]="Mira", ["Farm"]="Farm", ["Skins"]="Aparências", ["Visuals"] = "Visuais", ["Movement"] = "Movimento", ["Boxes"] = "Caixas", ["Settings"] = "Configuracoes", ["About"] = "Sobre",
     ["Account age"] = "Dias da conta", ["Executor"] = "Executor", ["Load time"] = "Carregamento", ["Session XP"] = "XP da sessao",
     ["Role ESP"] = "ESP por papel", ["Player names"] = "Nomes dos jogadores", ["Role labels"] = "Mostrar papeis",
     ["Distance labels"] = "Mostrar distancia", ["Health"] = "Vida", ["Tracers"] = "Linhas", ["Highlights"] = "Contornos",
@@ -1562,6 +1725,16 @@ local function adapted_window(engine, wind)
     end
     function w:CreateTab(o)
         local tab=wind and native:Tab({Title=tr(o.name)}) or native:AddTab({Title=tr(o.name)})
+        local labelRoot = wind and tab.UIElements.Main or tab.Frame
+        local titles = {}
+        if labelRoot then
+            for _, node in ipairs(labelRoot:GetDescendants()) do
+                if node:IsA("TextLabel") and node.Text == tr(o.name) then table.insert(titles,node) end
+            end
+        end
+        localize(function()
+            for _, label in ipairs(titles) do if label.Parent then label.Text=tr(o.name) end end
+        end)
         local t={tabPage=wind and tab.UIElements.ContainerFrameCanvas or tab.Container}
         function t:Select() native:SelectTab(wind and tab.Index or 1) end
         local function create(kind,d)
@@ -1716,6 +1889,7 @@ local function build_ui()
     local combat = tabs.Aimbot
     toggle(combat, "aim", "Aimbot")
     toggle(combat, "silent", "Silent aim")
+    toggle(combat, "trigger", "Trigger bot", nil, true)
     dropdown(combat, "aim_activation", "Activation", {"Hold", "Toggle", "Always"})
     app.controls.aim_key = combat:CreateKeybind({name = "Aim key", flag = "aim_key", value = app.aim_key,
         onChanged = function(key) app.aim_key = key; app.aim_latched = false end})
@@ -1733,7 +1907,7 @@ local function build_ui()
         callback = function(value) app.settings.fov_color = value end})
     local visual = tabs.Visuals
     for _, spec in ipairs({{"esp", "Role ESP"}, {"boxes", "Boxes"}, {"names", "Player names"}, {"role_labels", "Role labels"},
-        {"distance_labels", "Distance labels"}, {"health", "Health"}, {"tracers", "Tracers"}, {"chams", "Highlights"},
+        {"skeleton", "Skeleton"}, {"distance_labels", "Distance labels"}, {"health", "Health"}, {"tracers", "Tracers"}, {"chams", "Highlights"},
         {"lobby", "Show lobby"}, {"show_innocents", "Show innocents"}, {"esp_visible", "Visible only"},
         {"gun_esp", "Dropped gun ESP"}, {"coin_esp", "Coin ESP"}}) do toggle(visual, spec[1], spec[2]) end
     slider(visual, "esp_distance", "ESP distance", 20, 1500, 10)
@@ -1759,6 +1933,10 @@ local function build_ui()
     slider(farm, "xp_distance", "XP escape distance", 15, 100, 5)
     toggle(farm, "auto_gun", "Auto pickup gun", nil, true)
     farm:CreateButton({name = "Pick up gun now", callback = function() app.pickup_requested = true end})
+    combat:CreateButton({name = "Kill all as Murderer", callback = function()
+        local ok, reason = app.request_finish(true)
+        if not ok then window:Notify({title = tr("Kill all as Murderer"), content = tr(reason)}) end
+    end})
     farm:CreateButton({name = "Finish this round", callback = function()
         local ok, reason = app.request_finish()
         if not ok then window:Notify({title = tr("Finish round"), content = tr(reason)}) end
@@ -1818,7 +1996,11 @@ local function build_ui()
         dropdown(skins, group_key, kind .. " A–Z", letters, function(letter)
             if app.controls[key] and groups[letter] then app.controls[key]:Refresh(groups[letter]) end
         end)
-        dropdown(skins, key, kind .. " model", groups[chosen])
+        dropdown(skins, key, kind .. " model", groups[chosen], function(name)
+            if name ~= "Original" and app.load_seconds and not app.rebuilding and not app.settings.skins then
+                set_enabled("skins",true)
+            end
+        end)
     end
     dropdown(skins, "skin_style", "Material / style", {"Original", "Gold", "Neon", "Ice", "Rainbow"})
     dropdown(skins, "skin_effect", "Local effect", {"None", "Fire", "Sparkles", "Smoke", "Trail"})
