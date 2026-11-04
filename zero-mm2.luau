@@ -940,13 +940,24 @@ function app.troll_move_step(dt)
 end
 
 local function clean_visual_clone(source)
+    -- A display's rigid constraint also references the live character. Keep only geometry.
+    local mount = CFrame.identity
+    local rigid = source:FindFirstChildWhichIsA("RigidConstraint", true)
+    if source:IsA("BasePart") and rigid then
+        for _, attachment in ipairs({rigid.Attachment1, rigid.Attachment0}) do
+            if attachment and attachment:IsDescendantOf(source) then
+                mount = source.CFrame:ToObjectSpace(attachment.WorldCFrame)
+                break
+            end
+        end
+    end
     local cloned = source:Clone()
     if not cloned then return nil end
     local model = Instance.new("Model")
     model.Name = "ZERO_LocalSkin"
     cloned.Parent = model
     for _, object in ipairs(model:GetDescendants()) do
-        if object:IsA("LuaSourceContainer") or object:IsA("JointInstance") or object:IsA("WeldConstraint")
+        if object:IsA("Constraint") or object:IsA("BodyMover") or object:IsA("ObjectValue") or object:IsA("LuaSourceContainer") or object:IsA("JointInstance") or object:IsA("WeldConstraint")
             or object:IsA("Sound") or object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam")
             or object:IsA("Fire") or object:IsA("Smoke") or object:IsA("Sparkles") then object:Destroy()
         elseif object:IsA("BasePart") then
@@ -956,6 +967,8 @@ local function clean_visual_clone(source)
     end
     local primary = cloned:IsA("BasePart") and cloned or model:FindFirstChildWhichIsA("BasePart", true)
     if not primary then model:Destroy(); return nil end
+    primary.PivotOffset = CFrame.identity
+    model:SetAttribute("Mount", mount)
     model.PrimaryPart = primary
     model:PivotTo(CFrame.identity)
     return model
@@ -1067,10 +1080,20 @@ local function update_skin(kind)
         end
         attach_effect(model)
         model.Parent = workspace.CurrentCamera
-        overlay = {model = model, target = target, stamp = stamp}
+        local correction = CFrame.identity
+        local rigid = target:FindFirstChildWhichIsA("RigidConstraint", true)
+        if rigid then
+            for _, attachment in ipairs({rigid.Attachment1, rigid.Attachment0}) do
+                if attachment and attachment:IsDescendantOf(target) then
+                    correction = part.CFrame:ToObjectSpace(attachment.WorldCFrame) * model:GetAttribute("Mount"):Inverse()
+                    break
+                end
+            end
+        end
+        overlay = {model = model, target = target, stamp = stamp, correction = correction}
         skin_overlays[kind] = overlay
     end
-    overlay.model:PivotTo(part.CFrame)
+    overlay.model:PivotTo(part.CFrame * overlay.correction)
     for object, record in pairs(skin_hidden[kind]) do
         if object.Parent then object[record.key] = record.key == "LocalTransparencyModifier" and 1 or false end
     end
