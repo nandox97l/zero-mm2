@@ -162,6 +162,7 @@ function app.destroy()
     app.box_running = false
     if app.cleanup_extras then app.cleanup_extras() end
     if app.restore_movement then app.restore_movement() end
+    if app.launcher then app.launcher:Destroy() end
     if app.dashboard then app.dashboard:Destroy() end
     for _, connection in ipairs(app.connections) do connection:Disconnect() end
     restore_collisions()
@@ -509,7 +510,7 @@ local function move_to(destination, dt, owner, teleport, underground)
     remember_property(humanoid, "AutoRotate", false)
     remember_property(humanoid, "PlatformStand", true)
     local delta = destination - root.Position
-    local speed = math.max(6, app.settings.farm_speed * (0.75 ^ motion.corrections))
+    local speed = owner == "fling approach" and 75 or math.max(6, app.settings.farm_speed * (0.75 ^ motion.corrections))
     local step = speed * math.min(dt, 0.06)
     local position = teleport and destination or root.Position + (delta.Magnitude > step and delta.Unit * step or delta)
     local rotation = underground and CFrame.Angles(math.rad(90), 0, 0) or CFrame.Angles(0, select(2, root.CFrame:ToOrientation()), 0)
@@ -556,9 +557,12 @@ local function fling_step(target, dt)
     local character, root, humanoid = character_parts(local_player)
     local _, target_root = character_parts(target)
     if not target_root or not root then return false end
+    if fling_state and (fling_state.target ~= target_root or fling_state.root ~= root) then app.restore_movement() end
     if not fling_state then
-        if (root.Position - target_root.Position).Magnitude > 5 then
-            move_to(target_root.Position, dt, "approach", false, false)
+        local distance = (root.Position - target_root.Position).Magnitude
+        if distance > 9 then
+            local lead = math.clamp(distance / 75, 0, 0.25)
+            move_to(target_root.Position + target_root.AssemblyLinearVelocity * lead, dt, "fling approach", false, false)
             return true
         end
         app.restore_movement()
@@ -597,18 +601,33 @@ connect(RunService.PreSimulation, function(dt)
     local state = fling_state
     if not state or not state.root.Parent or not state.target.Parent then return end
     local root, target = state.root, state.target
-    local heading = state.heading
+    local velocity = target.AssemblyLinearVelocity
+    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+    local heading = horizontal.Magnitude > 4 and horizontal.Unit or state.heading
     local side = Vector3.new(-heading.Z, 0, heading.X)
     local direction = (heading + side * (math.sin(state.strikes * 0.38) * 0.18) + Vector3.yAxis * 0.52).Unit
     local speed = 720
     local travel = math.clamp(dt, 1/120, 1/30)
-    local contact = target.Position + target.AssemblyLinearVelocity * travel
-    local start = contact - direction * (2.1 + speed * travel * 0.35)
+    local lead = velocity * (travel + math.clamp(local_player:GetNetworkPing(), 0, 0.12))
+    if lead.Magnitude > 4 then lead = lead.Unit * 4 end
+    local contact = target.Position + lead
+    local start = contact - direction * 0.65
     root.CFrame = CFrame.lookAt(start, contact)
-    root.AssemblyLinearVelocity = direction * speed
+    root.AssemblyLinearVelocity = velocity + direction * speed
     root.AssemblyAngularVelocity = Vector3.new(0, 65, 0)
     state.strikes += 1
     app.stats.last_fling_strikes = state.strikes
+end)
+
+-- Keep the rendered character at the target after the physics solver has handled contact.
+connect(RunService.PostSimulation, function()
+    local state = fling_state
+    if not state or not state.root.Parent or not state.target.Parent then return end
+    local root, target = state.root, state.target
+    root.CFrame = CFrame.new(target.Position) * root.CFrame.Rotation
+    if target.AssemblyLinearVelocity.Magnitude > 5 then
+        app.stats.fling_moving_frames = (app.stats.fling_moving_frames or 0) + 1
+    end
 end)
 
 local function finish_step(dt)
@@ -1006,10 +1025,10 @@ local function fetch_skin_model(asset_id)
 end
 
 local function store_asset(name, kind)
-    local featured = {Harvester = 8211918819, Icepiercer = 13099349178}
+    local featured = {Harvester = 8211918819, Icepiercer = 13099349178, Candy = 7145570052, Luger = 12934634944, Fade = 288315111}
     if featured[name] then
-        local model = fetch_skin_model(featured[name])
-        if model then return model end
+        local loaded, model = pcall(fetch_skin_model, featured[name])
+        if loaded and model then return model end
     end
     local query = http:UrlEncode("MM2 " .. name)
     local url = "https://apis.roblox.com/toolbox-service/v1/"
@@ -1019,16 +1038,20 @@ local function store_asset(name, kind)
     if #ids == 0 then return end
     local details = http:JSONDecode(game:HttpGet(url .. "items/details?assetIds=" .. table.concat(ids, ",")))
     local function normalize(title)
-        return title:lower():gsub("murder mystery 2", ""):gsub("mm2", ""):gsub("[^%w]", "")
+        local words = {}
+        for token in title:lower():gsub("murder mystery 2", " "):gsub("mm2", " "):gmatch("[%w]+") do
+            if token ~= "from" and token ~= "godly" and token ~= "tool" and token ~= "working" then table.insert(words, token) end
+        end
+        return table.concat(words)
     end
     local wanted = normalize(name)
     for _, row in ipairs(details.data or {}) do
         local asset = row.asset
         local title = normalize(asset.name)
-        if asset.name:lower():find("mm2", 1, true) and row.fiatProduct and row.fiatProduct.purchasable and row.fiatProduct.purchasable.isFree
+        if (asset.name:lower():find("mm2", 1, true) or asset.name:lower():find("murder mystery 2", 1, true)) and row.fiatProduct and row.fiatProduct.purchasable and row.fiatProduct.purchasable.isFree
             and (title == wanted or title == wanted .. kind:lower()) then
-            local model = fetch_skin_model(asset.id)
-            if model then return model end
+            local loaded, model = pcall(fetch_skin_model, asset.id)
+            if loaded and model then return model end
         end
     end
     return nil
@@ -1036,8 +1059,9 @@ end
 
 local function request_skin(kind, selection)
     local key = kind .. "/" .. selection
-    if skin_loads[key] then return end
-    skin_loads[key] = true
+    local retry = skin_loads[key]
+    if retry and os.clock() < retry then return end
+    skin_loads[key] = math.huge
     skin_messages[kind] = selection .. " — loading"
     task.spawn(function()
         local id = catalog_ids[kind][selection] or selection
@@ -1046,12 +1070,15 @@ local function request_skin(kind, selection)
             if not item then return end
             local success, official = pcall(fetch_skin_model, item.ItemID)
             if success and official then return official end
-            return store_asset(item.ItemName or id, kind)
+            local name = item.ItemName or id
+            if item.Chroma and not name:lower():find("chroma", 1, true) then name = "Chroma " .. name end
+            return store_asset(name, kind)
         end)
         if not app.alive then if ok and model then model:Destroy() end; return end
         if ok and model then
             if skin_templates[kind][id] then model:Destroy() else skin_templates[kind][id] = model end
         end
+        skin_loads[key] = os.clock() + 45
         if app.settings[kind == "Gun" and "gun_skin" or "knife_skin"] == selection then
             skin_messages[kind] = skin_templates[kind][id] and "" or (selection .. " — 3D model unavailable")
         end
@@ -1182,6 +1209,8 @@ local function update_skin(kind)
             end
         end
         attach_effect(model)
+        model:SetAttribute("Skin", selection)
+        model:SetAttribute("Kind", kind)
         model.Parent = workspace.CurrentCamera
         local correction = CFrame.identity
         local rigid = target:FindFirstChildWhichIsA("RigidConstraint", true)
@@ -1862,7 +1891,7 @@ rebuild_ui = function(choice)
     app.controls = {}
     local ok, err = pcall(build_ui)
     if ok then
-        old:Unload()
+        if not old.unloaded then old:Unload() end
         if capabilities.writefile and not env.ZERO_MM2_TEST then pcall(writefile, gui_file, choice) end
     else
         if app.window ~= old then pcall(function() app.window:Unload() end) end
@@ -1878,6 +1907,26 @@ if ok_ui and library_name ~= "Rayfield Gen2" and not env.ZERO_MM2_TEST and app.f
     pcall(function() app.window:Load() end)
 end
 if not ok_ui then app.destroy(); error("ZERO MM2 UI: " .. tostring(ui_result)) end
+do
+    local overlay = Instance.new("ScreenGui")
+    overlay.Name, overlay.ResetOnSpawn, overlay.DisplayOrder = "ZERO_MenuLauncher", false, 1000000
+    overlay.Parent = app.ui_parent()
+    app.launcher = overlay
+    local button = Instance.new("TextButton")
+    button.Name, button.Text = "ToggleMenu", "ZERO  ·  Menu"
+    button.AnchorPoint = Vector2.new(0.5, 0)
+    button.Position, button.Size = UDim2.new(0.5, 0, 0, 2), UDim2.fromOffset(112, 30)
+    button.BackgroundColor3, button.TextColor3 = Color3.fromRGB(33, 39, 60), Color3.new(1, 1, 1)
+    button.Font, button.TextSize = Enum.Font.GothamMedium, 14
+    button.Parent = overlay
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius, corner.Parent = UDim.new(0, 8), button
+    connect(button.Activated, function()
+        if app.rebuilding then return end
+        if app.window.unloaded or not app.dashboard:IsDescendantOf(game) then rebuild_ui(library_name)
+        else app.window:ToggleHide() end
+    end)
+end
 app.load_seconds = os.clock() - load_started
 local fps_frames, fps_elapsed = 0, 0
 local executor_name, executor_version = "Unknown", ""
@@ -1885,7 +1934,7 @@ if capabilities.identifyexecutor then executor_name, executor_version = identify
 if app.settings.anti_afk then app.set_anti_afk(true) end
 app.refresh_features()
 function app.update_dashboard(dt)
-    if app.rebuilding then return end
+    if app.rebuilding or app.window.unloaded or not app.dashboard:IsDescendantOf(game) then return end
     fps_frames += 1; fps_elapsed += dt
     if fps_elapsed < 0.5 then return end
     app.stats.fps = fps_frames / fps_elapsed
@@ -1921,10 +1970,7 @@ local cache_elapsed = 0
 connect(RunService.Heartbeat, function(dt)
     if not app.alive then return end
     if app.rebuilding then return end
-    if app.window.unloaded then
-        app.destroy()
-        return
-    end
+
     cache_elapsed += dt
     if cache_elapsed >= 0.5 then
         cache_elapsed = 0
