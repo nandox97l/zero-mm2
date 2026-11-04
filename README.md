@@ -5,7 +5,7 @@
 Abre o MM2, liga o Real à partida e executa a linha abaixo. O botão **ZERO · Menu** e a tecla **Ctrl direito** mostram ou escondem a interface.
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/nandox97l/zero-mm2/main/zero-mm2.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/nandox97l/zero-mm2/main/zero-mm2.luau?t=" .. os.time()))()
 ```
 
 | Aba | O que faz |
