@@ -72,7 +72,7 @@ local feature_specs = {
     {"silent", "Silent aim", {}, {"weapon", "round"}}, {"farm", "Farm", {"firetouchinterest"}, {"round"}},
     {"xp", "XP", {}, {"round"}}, {"gun", "Gun pickup", {"firetouchinterest"}, {"round"}},
     {"movement", "Movement", {}, {}}, {"troll", "Troll", {}, {}},
-    {"fling", "Fling", {"gethiddenproperty", "sethiddenproperty"}, {}}, {"skins", "Local skins", {}, {}},
+    {"fling", "Fling", {}, {}}, {"skins", "Local skins", {}, {}},
     {"afk", "Anti-AFK", {"getconnections"}, {}}, {"boxes", "Boxes", {}, {"catalog", "profile"}},
     {"config", "Configurations", {"readfile", "writefile", "isfile"}, {}}, {"language", "Languages", {}, {"ui"}},
 }
@@ -437,10 +437,9 @@ end
 
 function app.restore_movement()
     if app.flight_force then app.flight_force:Destroy(); app.flight_force = nil end
-    if fling_state and fling_state.claimed and fling_state.root.Parent then
-        pcall(sethiddenproperty, fling_state.root, "PhysicsRepRootPart", fling_state.previous_rep_root)
+    if fling_state and fling_state.root.Parent and local_player.Character and fling_state.root == local_player.Character:FindFirstChild("HumanoidRootPart") then
+        fling_state.root.CFrame = fling_state.origin
     end
-    if fling_state and fling_state.spin then fling_state.spin:Destroy() end
     fling_state = nil
     for object, entry in pairs(movement_originals) do
         if object.Parent then for key, old in pairs(entry) do object[key] = old.value end end
@@ -564,20 +563,17 @@ local function fling_step(target, dt)
         end
         app.restore_movement()
         fling_state = {root = root, started = os.clock(), origin = root.CFrame,
-            target_origin = target_root.Position, peak_speed = 0, previous_velocity = root.AssemblyLinearVelocity}
-        local read_ok, previous = pcall(gethiddenproperty, root, "PhysicsRepRootPart")
-        if read_ok then
-            local write_ok, hidden = pcall(sethiddenproperty, root, "PhysicsRepRootPart", target_root)
-            fling_state.claimed = write_ok and hidden == true
-            fling_state.previous_rep_root = previous
-        end
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") then
-                remember_property(part, "CanCollide", true)
-                remember_property(part, "Massless", true)
-                remember_property(part, "CustomPhysicalProperties", PhysicalProperties.new(100, 0.3, 0.5))
-            end
-        end
+            target_origin = target_root.Position, peak_speed = 0}
+        local offset = target_root.Position - root.Position
+        local horizontal = Vector3.new(offset.X, 0, offset.Z)
+        fling_state.heading = horizontal.Magnitude > 0.1 and horizontal.Unit or Vector3.xAxis
+        fling_state.target = target_root
+        fling_state.strikes = 0
+        app.stats.last_fling_strikes = 0
+        remember_property(root, "CanCollide", true)
+        remember_property(root, "CollisionGroup", "Default")
+        remember_property(root, "Massless", false)
+        remember_property(root, "CustomPhysicalProperties", PhysicalProperties.new(100, 0.1, 0.5))
         remember_property(humanoid, "PlatformStand", true)
         motion.root, motion.owner = root, "fling"
     end
@@ -589,24 +585,30 @@ local function fling_step(target, dt)
     app.farm_status = "Fling: " .. target.DisplayName
     if elapsed > 6 or (target_root.Position - fling_state.target_origin).Magnitude > 150 then
         app.stats.last_fling_displacement = (target_root.Position - fling_state.target_origin).Magnitude
-        local origin = fling_state.origin
         app.restore_movement()
-        root.CFrame = origin
         app.finish_active, app.troll_fling_active = false, false
         return false
     end
-    local angle = elapsed * 45
-    -- MonoMM2 / fleecewtf: pulse velocity between physics and rendering, restore afterwards.
-    root.CFrame = target_root.CFrame * CFrame.new(math.cos(angle) * 0.1, 0, math.sin(angle) * 0.1)
-    fling_state.previous_velocity = Vector3.zero
-    root.AssemblyLinearVelocity = Vector3.new(math.cos(angle) * 100, 10000, math.sin(angle) * 100)
     return true
 end
 
-connect(RunService.RenderStepped, function()
-    if fling_state and fling_state.root.Parent then
-        fling_state.root.AssemblyLinearVelocity = fling_state.previous_velocity
-    end
+-- Launch from just outside the target towards its torso before each physics step.
+connect(RunService.PreSimulation, function(dt)
+    local state = fling_state
+    if not state or not state.root.Parent or not state.target.Parent then return end
+    local root, target = state.root, state.target
+    local heading = state.heading
+    local side = Vector3.new(-heading.Z, 0, heading.X)
+    local direction = (heading + side * (math.sin(state.strikes * 0.38) * 0.18) + Vector3.yAxis * 0.52).Unit
+    local speed = 720
+    local travel = math.clamp(dt, 1/120, 1/30)
+    local contact = target.Position + target.AssemblyLinearVelocity * travel
+    local start = contact - direction * (2.1 + speed * travel * 0.35)
+    root.CFrame = CFrame.lookAt(start, contact)
+    root.AssemblyLinearVelocity = direction * speed
+    root.AssemblyAngularVelocity = Vector3.new(0, 65, 0)
+    state.strikes += 1
+    app.stats.last_fling_strikes = state.strikes
 end)
 
 local function finish_step(dt)
@@ -768,7 +770,7 @@ function app.farm_step(dt)
         if not in_round then app.farm_status = "Waiting for round"
         elseif not app.settings.farm and not app.settings.xp_farm then app.farm_status = "Idle" end
     end
-    if app.settings.noclip or (motion.owner and motion.owner ~= "fling" and motion.owner ~= "flight") then
+    if (app.settings.noclip and not fling_state) or (motion.owner and motion.owner ~= "fling" and motion.owner ~= "flight") then
         noclip_character(character)
     elseif not fling_state then restore_collisions() end
     if app.settings.speed_enabled then remember_property(humanoid, "WalkSpeed", app.settings.walk_speed)
