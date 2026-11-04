@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: MIT
 -- Creator: Nandox | Open source, unobfuscated
 -- Language: Luau | File: zero-mm2.luau | Runtime: Real | Target: MM2, place 142823291 v1460
--- UI: Sirius Rayfield Gen2 (MPL-2.0). Gameplay implementation derived from live v1460 inspection.
+-- UI: WindUI, Rayfield Gen2 or Fluent. Gameplay implementation derived from live v1460 inspection.
 -- Reference: OminousVibes MM2, role-color ESP, GunDrop discovery and velocity prediction patterns.
 -- References: EdgeIY/infiniteyield, Zyn-ic/MM2-AutoFarm, fleecewtf/MonoMM2.
 -- https://github.com/OminousVibes-Exploit/Scripts/blob/main/Murder%20Mystery%202.lua
@@ -67,7 +67,7 @@ app.capabilities = capabilities
 app.features, app.module_ready, app.runtime_failures = {}, {}, {}
 app.focused = true
 local feature_specs = {
-    {"player", "Player", {}, {}}, {"ui", "Rayfield Gen2", {}, {"ui"}},
+    {"player", "Player", {}, {}}, {"ui", "Interface", {}, {"ui"}},
     {"esp", "ESP / FOV", {"Drawing"}, {"round"}}, {"aim", "Aimbot", {"mousemoverel"}, {"round"}},
     {"silent", "Silent aim", {}, {"weapon", "round"}}, {"farm", "Farm", {"firetouchinterest"}, {"round"}},
     {"xp", "XP", {}, {"round"}}, {"gun", "Gun pickup", {"firetouchinterest"}, {"round"}},
@@ -974,7 +974,90 @@ local function clean_visual_clone(source)
     return model
 end
 
-function app.refresh_skin_catalog()
+local skin_loads = {}
+local skin_messages = {Gun = "", Knife = ""}
+local catalog_ids = {Gun = {}, Knife = {}}
+local http = game:GetService("HttpService")
+
+local function fetch_skin_model(asset_id)
+    local objects = game:GetObjects("rbxassetid://" .. tostring(asset_id))
+    local model
+    for _, object in ipairs(objects) do
+        if not model then
+            local handle = object:IsA("BasePart") and object or object:FindFirstChild("Handle", true) or object:FindFirstChildWhichIsA("BasePart", true)
+            if handle and handle:IsA("BasePart") then
+                -- Copy only render geometry from external models, never scripts or constraints.
+                local visual = handle:Clone()
+                for _, child in ipairs(visual:GetChildren()) do
+                    if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance") or child:IsA("Decal")) then child:Destroy()
+                    else child:ClearAllChildren() end
+                end
+                model = clean_visual_clone(visual)
+                visual:Destroy()
+                local mount = handle:FindFirstChild("CustomAttachment") or handle:FindFirstChild("Attachment")
+                if model and mount and mount:IsA("Attachment") then model:SetAttribute("Mount", mount.CFrame) end
+            end
+        end
+        object:Destroy()
+    end
+    return model
+end
+
+local function store_asset(name, kind)
+    local featured = {Harvester = 8211918819, Icepiercer = 13099349178}
+    if featured[name] then
+        local model = fetch_skin_model(featured[name])
+        if model then return model end
+    end
+    local query = http:UrlEncode("MM2 " .. name)
+    local url = "https://apis.roblox.com/toolbox-service/v1/"
+    local results = http:JSONDecode(game:HttpGet(url .. "marketplace/10?limit=10&keyword=" .. query))
+    local ids = {}
+    for _, row in ipairs(results.data or {}) do table.insert(ids, tostring(row.id)) end
+    if #ids == 0 then return end
+    local details = http:JSONDecode(game:HttpGet(url .. "items/details?assetIds=" .. table.concat(ids, ",")))
+    local function normalize(title)
+        return title:lower():gsub("murder mystery 2", ""):gsub("mm2", ""):gsub("[^%w]", "")
+    end
+    local wanted = normalize(name)
+    for _, row in ipairs(details.data or {}) do
+        local asset = row.asset
+        local title = normalize(asset.name)
+        if asset.name:lower():find("mm2", 1, true) and row.fiatProduct and row.fiatProduct.purchasable and row.fiatProduct.purchasable.isFree
+            and (title == wanted or title == wanted .. kind:lower()) then
+            local model = fetch_skin_model(asset.id)
+            if model then return model end
+        end
+    end
+    return nil
+end
+
+local function request_skin(kind, selection)
+    local key = kind .. "/" .. selection
+    if skin_loads[key] then return end
+    skin_loads[key] = true
+    skin_messages[kind] = selection .. " — loading"
+    task.spawn(function()
+        local id = catalog_ids[kind][selection] or selection
+        local item = (Sync.Weapons or Sync.Item)[id]
+        local ok, model = pcall(function()
+            if not item then return end
+            local success, official = pcall(fetch_skin_model, item.ItemID)
+            if success and official then return official end
+            return store_asset(item.ItemName or id, kind)
+        end)
+        if not app.alive then if ok and model then model:Destroy() end; return end
+        if ok and model then
+            if skin_templates[kind][id] then model:Destroy() else skin_templates[kind][id] = model end
+        end
+        if app.settings[kind == "Gun" and "gun_skin" or "knife_skin"] == selection then
+            skin_messages[kind] = skin_templates[kind][id] and "" or (selection .. " — 3D model unavailable")
+        end
+    end)
+end
+
+
+function app.refresh_skin_catalog(force)
     for _, player in ipairs(Players:GetPlayers()) do
         local character = player.Character
         for _, kind in ipairs({"Knife", "Gun"}) do
@@ -987,13 +1070,26 @@ function app.refresh_skin_catalog()
             end
         end
     end
+    if force == true then table.clear(skin_loads) end
+    if app.skin_catalog and #app.skin_catalog.Knife + #app.skin_catalog.Gun > 2 then return app.skin_catalog end
     local options = {Knife = {"Original"}, Gun = {"Original"}}
-    for _, kind in ipairs({"Knife", "Gun"}) do
-        for id in pairs(skin_templates[kind]) do table.insert(options[kind], id) end
-        table.sort(options[kind])
-        local control = app.controls[kind == "Knife" and "knife_skin" or "gun_skin"]
-        if control then control:Refresh(options[kind]) end
+    local weapons = Sync.Weapons or Sync.Item or {}
+    local counts = {Gun = {}, Knife = {}}
+    for id, item in pairs(weapons) do
+        local names = counts[item.ItemType]
+        local name = item.ItemName or id
+        if names then names[name] = (names[name] or 0) + 1 end
     end
+    for id, item in pairs(weapons) do
+        local kind, name = item.ItemType, item.ItemName or id
+        if options[kind] then
+            local label = counts[kind][name] > 1 and (name .. " [" .. id .. "]") or name
+            catalog_ids[kind][label] = id
+            table.insert(options[kind], label)
+        end
+    end
+    table.sort(options.Gun)
+    table.sort(options.Knife)
     app.skin_catalog = options
     return options
 end
@@ -1054,8 +1150,13 @@ local function update_skin(kind)
     local stamp = selection .. app.settings.skin_style .. app.settings.skin_effect .. tostring(app.settings.skin_color)
     local overlay = skin_overlays[kind]
     if not overlay or overlay.target ~= target or overlay.stamp ~= stamp then
-        clear_skin(kind)
-        local template = skin_templates[kind][selection]
+        if overlay then clear_skin(kind) end
+        local template = skin_templates[kind][catalog_ids[kind][selection] or selection]
+        if selection ~= "Original" and not template then
+            request_skin(kind, selection)
+            app.skin_status = skin_messages[kind]
+            return
+        end
         local model = template and template:Clone() or clean_visual_clone(target)
         if not model then app.runtime_failures.skins = "Visual model unavailable"; return end
         if selection ~= "Original" and not template then app.skin_status = "Selected skin is not loaded in this server"
@@ -1153,6 +1254,16 @@ function app.extra_render(dt)
         table.clear(rainbow_originals)
     end
     update_skin("Knife"); update_skin("Gun")
+    if app.settings.skins then
+        local messages = {}
+        for _, kind in ipairs({"Gun", "Knife"}) do
+            local selection = app.settings[kind == "Gun" and "gun_skin" or "knife_skin"]
+            if selection ~= "Original" and not skin_templates[kind][catalog_ids[kind][selection] or selection] then
+                table.insert(messages, selection .. (skin_messages[kind]:find("unavailable") and " — 3D unavailable" or " — loading"))
+            end
+        end
+        if #messages > 0 then app.skin_status = table.concat(messages, " / ") end
+    end
     extras_elapsed += dt
     if extras_elapsed >= 10 then
         extras_elapsed = 0
@@ -1167,7 +1278,7 @@ connect(Players.PlayerRemoving, function() task.defer(app.refresh_targets) end)
 
 
 function app.render_step(dt)
-    if not app.alive then return end
+    if not app.alive or app.rebuilding then return end
     local camera = workspace.CurrentCamera
     if not camera then return end
     app.stats.frames += 1
@@ -1288,6 +1399,7 @@ function app.diagnostics()
 end
 
 local translations = {pt = {
+    ["UI library"]="Biblioteca da interface", ["Gun A–Z"]="Pistolas A–Z", ["Knife A–Z"]="Facas A–Z",
     ["Local skins"] = "Skins locais", ["Target player"] = "Jogador alvo", ["Refresh players"] = "Atualizar jogadores",
     ["Follow target"] = "Seguir alvo", ["Orbit target"] = "Orbitar alvo", ["Orbit radius"] = "Raio da orbita",
     ["Orbit height"] = "Altura da orbita", ["Orbit speed"] = "Velocidade da orbita", ["Spectate target"] = "Observar alvo",
@@ -1298,7 +1410,7 @@ local translations = {pt = {
     ["Local skin changer"] = "Skins locais", ["Knife model"] = "Modelo da faca", ["Gun model"] = "Modelo da pistola",
     ["Material / style"] = "Material / estilo", ["Local effect"] = "Efeito local", ["Skin color"] = "Cor da skin",
     ["Refresh skin catalog"] = "Atualizar catalogo de skins", ["Restore original visuals"] = "Restaurar visual original",
-    ["Models come from weapons already loaded in this server. Changes are visible only to you and do not alter inventory."] = "Modelos de armas ja carregadas neste servidor. Alteracoes visiveis apenas para ti; o inventario nao muda.",
+    ["Complete MM2 catalog. Models load on selection from the game or the Creator Store. Unavailable models are marked."] = "Modelos de armas ja carregadas neste servidor. Alteracoes visiveis apenas para ti; o inventario nao muda.",
     ["Local visuals active"] = "Visuais locais ativos", ["Selected skin is not loaded in this server"] = "Skin selecionada nao carregada neste servidor",
     ["Following target"] = "A seguir alvo", ["Orbiting target"] = "A orbitar alvo", ["Load status"] = "Estado do carregamento",
     ["Executor compatibility"] = "Compatibilidade do executor", ["All modules loaded"] = "Todos os modulos carregados",
@@ -1358,10 +1470,132 @@ local function tr(text)
     return text
 end
 app.translate = tr
-local ok_ui, ui_result = pcall(function()
-    local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+local libraries = {"WindUI", "Rayfield Gen2", "Fluent"}
+local gui_file = "ZERO-MM2-library.txt"
+local library_name = "WindUI"
+if capabilities.isfile and capabilities.readfile then
+    local ok, saved = pcall(function() return isfile(gui_file) and readfile(gui_file) end)
+    if ok and table.find(libraries, saved) then library_name = saved end
+end
+local ui_urls = {
+    WindUI = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+    Fluent = "https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua",
+    ["Rayfield Gen2"] = "https://sirius.menu/gen2",
+}
+local rebuild_ui
+local function adapted_window(engine, wind)
+    local native = engine:CreateWindow(wind and {Title="ZERO | MM2", Author="Nandox", Folder="ZERO-MM2", Size=UDim2.fromOffset(650,490), ToggleKey=Enum.KeyCode.RightControl}
+        or {Title="ZERO | MM2",SubTitle="Nandox",TabWidth=145,Size=UDim2.fromOffset(650,490),Theme="Dark",MinimizeKey=Enum.KeyCode.RightControl})
+    local w = {unloaded=false}
+    if wind then native:OnDestroy(function() w.unloaded=true end) end
+    local states = {}
+    local locale_items = {}
+    local function localize(fn) table.insert(locale_items,fn) end
+    function w:SetLocale()
+        for _,fn in ipairs(locale_items) do pcall(fn) end
+    end
+    function w:Unload() self.unloaded=true; if wind then native:Destroy() else engine:Destroy() end end
+    function w:Notify(o) engine:Notify({Title=o.title,Desc=o.content,Content=o.content,Duration=4}) end
+    function w:ChangeTheme(theme)
+        local themes = wind and {cobalt="Indigo",ember="Amber",amethyst="Violet",frost="Sky",rose="Rose",default="Dark"}
+            or {cobalt="Dark",ember="Darker",amethyst="Amethyst",frost="Light",rose="Rose",default="Dark"}
+        pcall(function() engine:SetTheme(themes[theme] or "Dark") end)
+    end
+    function w:ToggleHide() if wind then native:Toggle() else native:Minimize() end end
+    function w:Popup(o)
+        local buttons = {}
+        for _, b in ipairs(o.options) do table.insert(buttons,{Title=b.text,Callback=b.callback or function() end}) end
+        local dialog=native:Dialog({Title=o.title,Content=o.content,Buttons=buttons})
+        if wind then dialog:Open() end
+    end
+    function w:Save()
+        local data={}
+        for key,row in pairs(states) do
+            local value=row.value
+            if typeof(value)=="Color3" then value={color=value:ToHex()} elseif typeof(value)=="EnumItem" then value={key=value.Name} end
+            data[key]=value
+        end
+        writefile("ZERO-MM2-ui-settings.json", http:JSONEncode(data))
+    end
+    function w:Load()
+        if not isfile("ZERO-MM2-ui-settings.json") then return end
+        local ok,data=pcall(function() return http:JSONDecode(readfile("ZERO-MM2-ui-settings.json")) end)
+        if not ok or type(data)~="table" then return end
+        for key,value in pairs(data) do
+            local row=states[key]
+            if row then pcall(function()
+                if type(value)=="table" then value=value.color and Color3.fromHex(value.color) or Enum.KeyCode[value.key] end
+                row.control:Set(value)
+            end) end
+        end
+    end
+    function w:CreateTab(o)
+        local tab=wind and native:Tab({Title=tr(o.name)}) or native:AddTab({Title=tr(o.name)})
+        local t={tabPage=wind and tab.UIElements.ContainerFrameCanvas or tab.Container}
+        function t:Select() native:SelectTab(wind and tab.Index or 1) end
+        local function create(kind,d)
+            local row: any = {value=d.value}
+            if row.value==nil then row.value=d.color end
+            local function changed(v)
+                if v==nil then return end
+                row.value=v
+                if kind=="Keybind" then if d.onChanged then d.onChanged(typeof(v)=="EnumItem" and v or Enum.KeyCode[v]) end
+                elseif d.callback then d.callback(v) end
+            end
+            local title=tr(d.name or " ")
+            local text=d.text or d.description or ""
+            local args={Title=title,Desc=tr(text),Description=tr(text),Content=tr(text),Value=d.value,Default=d.value,Callback=changed}
+            local element
+            if kind=="Text" then element=wind and tab:Paragraph(args) or tab:AddParagraph(args)
+            elseif kind=="Button" then args.Callback=d.callback; element=wind and tab:Button(args) or tab:AddButton(args)
+            else
+                if kind=="Dropdown" then args.Values=d.options;args.AllowNone=false
+                elseif kind=="Slider" then
+                    args.Min,args.Max=d.range[1],d.range[2];args.Step=d.increment;args.Rounding=math.max(0,math.ceil(-math.log10(d.increment)))
+                    if wind then args.Value={Min=args.Min,Max=args.Max,Default=d.value} end
+                elseif kind=="ColorPicker" then args.Default=d.color;args.Value=d.color
+                elseif kind=="Keybind" then
+                    args.Value=d.value.Name;args.Default=d.value.Name;args.Callback=d.flag=="menu_key" and function() end or d.callback or function() end
+                    local function key_changed(v)
+                        if d.flag=="menu_key" then
+                            local key=typeof(v)=="EnumItem" and v or Enum.KeyCode[v]
+                            if wind then native:SetToggleKey(key) else native.MinimizeKey=key end
+                        end
+                        changed(v)
+                    end
+                    args.ChangedCallback=key_changed;args.OnChanged=key_changed
+                end
+                local method=kind=="ColorPicker" and "Colorpicker" or kind
+                if wind then element=tab[method](tab,args) else element=tab["Add"..method](tab,d.flag,args) end
+            end
+            local c={}
+            function c:Set(v)
+                if kind=="Text" then if row.last~=v then element:SetDesc(v);row.last=v end
+                elseif wind and kind=="Dropdown" then element:Select(v)
+                elseif wind then element:Set(v)
+                elseif kind=="ColorPicker" then element:SetValueRGB(v)
+                else element:SetValue(v) end
+            end
+            function c:Refresh(values) if wind then element:Refresh(values) else element:SetValues(values) end end
+            localize(function()
+                if element.SetTitle then element:SetTitle(tr(d.name or " ")) end
+                if text~="" and element.SetDesc then element:SetDesc(tr(text)) end
+            end)
+            if d.flag and d.flag~="library" and not d.forgetState then row.control=c;states[d.flag]=row end
+            return c
+        end
+        for _,kind in ipairs({"Text","Button","Dropdown","Toggle","ColorPicker","Keybind","Slider"}) do
+            t["Create"..kind]=function(_,d) return create(kind,d) end
+        end
+        return t
+    end
+    return w
+end
+
+local function build_ui()
+    local engine = loadstring(game:HttpGet(ui_urls[library_name]))()
     local testing = env.ZERO_MM2_TEST == true
-    local window = Rayfield:CreateWindow({name = "ZERO | MM2", subtitle = "Nandox · v3", sidebarLayout = true,
+    local window = library_name ~= "Rayfield Gen2" and adapted_window(engine, library_name == "WindUI") or engine:CreateWindow({name = "ZERO | MM2", subtitle = "Nandox · v3", sidebarLayout = true,
         theme = "cobalt", showName = "ZERO MM2", locale = "pt", translations = translations,
         configuration = {autoSave = not testing and app.feature_available("config"), autoLoad = not testing and app.feature_available("config"), fileName = "ZERO-MM2-v2", customFolder = "ZERO"}})
     app.window = window
@@ -1532,15 +1766,36 @@ local ok_ui, ui_result = pcall(function()
     local skins = tabs.Skins
     local catalog = app.refresh_skin_catalog()
     toggle(skins, "skins", "Local skin changer")
-    dropdown(skins, "knife_skin", "Knife model", catalog.Knife)
-    dropdown(skins, "gun_skin", "Gun model", catalog.Gun)
+    -- Keep the entire catalog accessible without constructing a thousand UI rows on launch.
+    for _, kind in ipairs({"Knife", "Gun"}) do
+        local key = string.lower(kind) .. "_skin"
+        local group_key = key .. "_group"
+        local groups, letters = {}, {}
+        for _, name in ipairs(catalog[kind]) do
+            if name ~= "Original" then
+                local letter = name:sub(1,1):upper()
+                if not groups[letter] then groups[letter] = {"Original"}; table.insert(letters, letter) end
+                table.insert(groups[letter], name)
+            end
+        end
+        if #letters == 0 then letters = {"A"}; groups.A = {"Original"} end
+        table.sort(letters)
+        local initial = app.settings[key]:sub(1,1):upper()
+        local chosen = app.settings[group_key] or (groups[initial] and initial) or letters[1]
+        if not groups[chosen] then chosen = letters[1] end
+        app.settings[group_key] = chosen
+        dropdown(skins, group_key, kind .. " A–Z", letters, function(letter)
+            if app.controls[key] and groups[letter] then app.controls[key]:Refresh(groups[letter]) end
+        end)
+        dropdown(skins, key, kind .. " model", groups[chosen])
+    end
     dropdown(skins, "skin_style", "Material / style", {"Original", "Gold", "Neon", "Ice", "Rainbow"})
     dropdown(skins, "skin_effect", "Local effect", {"None", "Fire", "Sparkles", "Smoke", "Trail"})
     skins:CreateColorPicker({name = "Skin color", flag = "skin_color", color = app.settings.skin_color,
         callback = function(color) app.settings.skin_color = color end})
-    skins:CreateButton({name = "Refresh skin catalog", callback = app.refresh_skin_catalog})
+    skins:CreateButton({name = "Refresh skin catalog", callback = function() app.refresh_skin_catalog(true) end})
     skins:CreateButton({name = "Restore original visuals", callback = function() set_enabled("skins", false) end})
-    skins:CreateText({text = "Models come from weapons already loaded in this server. Changes are visible only to you and do not alter inventory."})
+    skins:CreateText({text = "Complete MM2 catalog. Models load on selection from the game or the Creator Store. Unavailable models are marked."})
     app.skin_text = skins:CreateText({name = "Status", text = "Original"})
 
     local boxes = tabs.Boxes
@@ -1571,6 +1826,10 @@ local ok_ui, ui_result = pcall(function()
     end})
     boxes:CreateButton({name = "Stop opening", callback = function() app.box_running = false end})
     local settings = tabs.Settings
+    app.settings.library = library_name
+    dropdown(settings, "library", "UI library", libraries, function(choice)
+        if choice ~= library_name and table.find(libraries, choice) and not app.rebuilding then task.defer(rebuild_ui, choice) end
+    end)
     toggle(settings, "anti_afk", "Anti-AFK", "Disables idle callbacks without clicking or activating weapons.")
     dropdown(settings, "language", "Language", {"Portugues", "English"}, function(value)
         app.settings.locale = value == "English" and "en" or "pt"
@@ -1587,11 +1846,35 @@ local ok_ui, ui_result = pcall(function()
     settings:CreateButton({name = "Unload", callback = app.destroy})
     settings:CreateKeybind({name = "Menu key", flag = "menu_key", value = Enum.KeyCode.RightControl, callback = function() window:ToggleHide() end})
     tabs.About:CreateText({name = "Creator", text = "Nandox\nZERO MM2 · v3 — Open source"})
-    tabs.About:CreateText({name = "Library", text = "Sirius Rayfield Gen2 · MPL-2.0\nhttps://sirius.menu/gen2"})
+    tabs.About:CreateText({name = "Library", text = "" .. library_name .. "\n" .. ui_urls[library_name]})
     tabs.About:CreateText({name = "References", text = "Infinite Yield / EdgeIY: flight, noclip, fling concepts.\nZynic MM2 AutoFarm: closest coin and timed movement.\nOminousVibes MM2: role ESP, gun drop and prediction.\nCurrent game inspection: weapons, shop, coin bag events."})
     tabs.About:CreateText({text = "MonoMM2 / fleecewtf: fling physics pulse.\nhttps://github.com/fleecewtf/MonoMM2\nhttps://github.com/EdgeIY/infiniteyield\nhttps://github.com/Zyn-ic/MM2-AutoFarm"})
     tabs.Player:Select(true)
-end)
+end
+rebuild_ui = function(choice)
+    if app.rebuilding or not app.alive then return end
+    app.rebuilding = true
+    local old, previous = app.window, library_name
+    local previous_controls, previous_tabs, previous_labels = app.controls, app.tabs, app.player_labels
+    library_name = choice
+    app.controls = {}
+    local ok, err = pcall(build_ui)
+    if ok then
+        old:Unload()
+        if capabilities.writefile and not env.ZERO_MM2_TEST then pcall(writefile, gui_file, choice) end
+    else
+        if app.window ~= old then pcall(function() app.window:Unload() end) end
+        app.window, app.controls, app.tabs, app.player_labels = old, previous_controls, previous_tabs, previous_labels
+        library_name, app.settings.library = previous, previous
+        old:Notify({title="UI", content=tostring(err)})
+    end
+    app.rebuilding = false
+end
+app.switch_library = rebuild_ui
+local ok_ui, ui_result = pcall(build_ui)
+if ok_ui and library_name ~= "Rayfield Gen2" and not env.ZERO_MM2_TEST and app.feature_available("config") then
+    pcall(function() app.window:Load() end)
+end
 if not ok_ui then app.destroy(); error("ZERO MM2 UI: " .. tostring(ui_result)) end
 app.load_seconds = os.clock() - load_started
 local fps_frames, fps_elapsed = 0, 0
@@ -1600,6 +1883,7 @@ if capabilities.identifyexecutor then executor_name, executor_version = identify
 if app.settings.anti_afk then app.set_anti_afk(true) end
 app.refresh_features()
 function app.update_dashboard(dt)
+    if app.rebuilding then return end
     fps_frames += 1; fps_elapsed += dt
     if fps_elapsed < 0.5 then return end
     app.stats.fps = fps_frames / fps_elapsed
@@ -1634,6 +1918,7 @@ app.coin_parts = CollectionService:GetTagged("ServerCoinPart")
 local cache_elapsed = 0
 connect(RunService.Heartbeat, function(dt)
     if not app.alive then return end
+    if app.rebuilding then return end
     if app.window.unloaded then
         app.destroy()
         return
