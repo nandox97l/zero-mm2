@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: MIT
 -- Creator: Nandox | Open source, unobfuscated
--- Language: Luau | File: zero-mm2.luau | Runtime: Real | Target: MM2, place 142823291 v1460
+-- Language: Luau | File: zero-mm2.luau | Runtime: Real | Target: MM2, place 142823291 v1461
 -- UI: WindUI, Rayfield Gen2 or Fluent. Gameplay implementation derived from live v1460 inspection.
 -- Reference: OminousVibes MM2, role-color ESP, GunDrop discovery and velocity prediction patterns.
 -- References: EdgeIY/infiniteyield, Zyn-ic/MM2-AutoFarm, fleecewtf/MonoMM2, Aluxis/MM2-Utilities.
@@ -1039,7 +1039,8 @@ end
 
 local idle_connections = {}
 local skin_templates = {Knife = {}, Gun = {}}
-local native_grips = {}
+local skin_cache_dirty = false
+local skin_cache_file = "ZERO-MM2-models-v1.json"
 local skin_overlays = {}
 local skin_hidden = {}
 local spectate_original = nil
@@ -1168,8 +1169,6 @@ local function clean_visual_clone(source)
         if not own:IsDescendantOf(source) then own, body = body, own end
         if own:IsDescendantOf(source) and source:IsA("BasePart") and body.Parent and body.Parent:IsA("BasePart") then
             model:SetAttribute("BeltMount", source.CFrame:ToObjectSpace(own.WorldCFrame))
-            model:SetAttribute("BeltPosition", body.Position / body.Parent.Size)
-            model:SetAttribute("BeltRotation", body.CFrame.Rotation)
             model:SetAttribute("NativeDisplay", true)
         end
     end
@@ -1182,8 +1181,51 @@ local skin_messages = {Gun = "", Knife = ""}
 local catalog_ids = {Gun = {}, Knife = {}}
 local http = game:GetService("HttpService")
 
+local skin_pending = {}
+local skin_rejected_until = {}
+local function register_skin_model(kind, id, model)
+    local key = kind .. "/" .. id
+    local existing = skin_templates[kind][id] or skin_pending[key]
+    if existing then
+        local hand = model:GetAttribute("HandMount")
+        local first, second = existing.PrimaryPart, model.PrimaryPart
+        local function mesh_id(part)
+            local mesh = part:FindFirstChildWhichIsA("SpecialMesh")
+            return (part:IsA("MeshPart") and part.MeshId or mesh and mesh.MeshId or ""):match("%d+")
+        end
+        if hand and not existing:GetAttribute("HandMount") and first and second
+            and mesh_id(first) == mesh_id(second) and (first.Size-second.Size).Magnitude < 0.001 then
+            existing:SetAttribute("HandMount", hand)
+            app.skin_catalog = nil
+            app.skin_revision += 1
+            skin_cache_dirty = true
+        end
+        model:Destroy()
+        return
+    end
+    skin_pending[key] = model
+    task.spawn(function()
+        local failed = false
+        local ready = pcall(function()
+            (game:GetService("ContentProvider") :: ContentProvider):PreloadAsync({model}, function(_, status)
+                if status ~= Enum.AssetFetchStatus.Success then failed = true end
+            end)
+        end)
+        skin_pending[key] = nil
+        if app.alive and ready and not failed and not skin_templates[kind][id] then
+            skin_templates[kind][id] = model
+            skin_cache_dirty = true
+            app.skin_revision += 1
+            app.skin_catalog = nil
+            app.refresh_skin_catalog()
+        else
+            skin_rejected_until[key] = os.clock() + 30
+            model:Destroy()
+        end
+    end)
+end
+
 function app.refresh_skin_catalog(force)
-    local changed = false
     for _, player in ipairs(Players:GetPlayers()) do
         local character = player.Character
         for _, kind in ipairs({"Knife", "Gun"}) do
@@ -1191,18 +1233,23 @@ function app.refresh_skin_catalog(force)
             local source = ref and ref:IsA("ObjectValue") and ref.Value
             local id = player:GetAttribute("Equipped" .. kind)
             local tool = character and character:FindFirstChild(kind)
-            if not tool and player == local_player then tool = local_player.Backpack:FindFirstChild(kind) end
-            if tool and tool:IsA("Tool") then
-                native_grips[kind] = tool.Grip
-                if skin_templates[kind][id] then skin_templates[kind][id]:SetAttribute("HandMount", tool.Grip) end
+            local backpack = player == local_player and local_player:FindFirstChild("Backpack")
+            if not tool and backpack then tool = backpack:FindFirstChild(kind) end
+            local native_tool = tool and tool:IsA("Tool") and tool:FindFirstChildWhichIsA("LocalScript", true)
+            if native_tool and skin_templates[kind][id] and skin_templates[kind][id]:GetAttribute("HandMount") ~= tool.Grip then
+                skin_templates[kind][id]:SetAttribute("HandMount", tool.Grip)
+                app.skin_catalog = nil
+                app.skin_revision += 1
+                skin_cache_dirty = true
             end
-            if source and type(id) == "string" and not skin_templates[kind][id] then
+            local key = kind .. "/" .. tostring(id)
+            if source and type(id) == "string" and not skin_templates[kind][id] and not skin_pending[key]
+                and os.clock() >= (skin_rejected_until[key] or 0) then
                 local clone = clean_visual_clone(source)
                 if clone then
                     if clone:GetAttribute("NativeDisplay") then
-                        skin_templates[kind][id] = clone
-                        if tool and tool:IsA("Tool") then clone:SetAttribute("HandMount", tool.Grip) end
-                        changed = true
+                        if native_tool then clone:SetAttribute("HandMount", tool.Grip) end
+                        register_skin_model(kind, id, clone)
                     else clone:Destroy() end
                 end
             end
@@ -1211,8 +1258,7 @@ function app.refresh_skin_catalog(force)
     if force == true then
         app.skin_catalog = nil
     end
-    if app.skin_catalog and not changed then return app.skin_catalog end
-    if changed then app.skin_revision += 1 end
+    if app.skin_catalog then return app.skin_catalog end
     local options = {Knife = {"Original"}, Gun = {"Original"}}
     local weapons = Sync.Weapons or Sync.Item or {}
     local counts = {Knife = {}, Gun = {}}
@@ -1226,7 +1272,7 @@ function app.refresh_skin_catalog(force)
         table.clear(catalog_ids[kind])
         local labels = {}
         for id, item in pairs(weapons) do
-            if type(item) == "table" and item.ItemType == kind and skin_templates[kind][id] and skin_templates[kind][id]:GetAttribute("NativeDisplay") then
+            if type(item) == "table" and item.ItemType == kind and skin_templates[kind][id] and skin_templates[kind][id]:GetAttribute("NativeDisplay") and skin_templates[kind][id]:GetAttribute("HandMount") then
                 local name = tostring(item.ItemName or id)
                 local label = (counts[kind][name] > 1 or name == "Original") and (name .. " [" .. tostring(id) .. "]") or name
                 catalog_ids[kind][label] = id
@@ -1237,7 +1283,143 @@ function app.refresh_skin_catalog(force)
         for _, label in ipairs(labels) do table.insert(options[kind], label) end
     end
     app.skin_catalog = options
+    for kind, pending in pairs(app.pending_skins or {}) do
+        local key = kind:lower() .. "_skin"
+        if app.settings[key] == "Original" and table.find(options[kind], pending) then
+            app.settings[key] = pending
+            app.pending_skins[kind] = nil
+        end
+    end
     return options
+end
+
+local function skin_vector(value)
+    assert(type(value) == "table" and #value == 3, "Invalid vector")
+    return Vector3.new(value[1], value[2], value[3])
+end
+
+function app.export_skin_library()
+    local result = {version = 1, Gun = {}, Knife = {}}
+    for _, kind in ipairs({"Gun", "Knife"}) do
+        for id, model in pairs(skin_templates[kind]) do
+            local record = {belt = {model:GetAttribute("BeltMount"):GetComponents()}, parts = {}}
+            local hand = model:GetAttribute("HandMount")
+            if hand then record.hand = {hand:GetComponents()} end
+            for _, part in ipairs(model:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local row = {
+                        class = part.ClassName, cf = {model:GetPivot():ToObjectSpace(part.CFrame):GetComponents()},
+                        size = {part.Size.X, part.Size.Y, part.Size.Z},
+                        color = {part.Color.R, part.Color.G, part.Color.B},
+                        transparency = part.Transparency, material = part.Material.Name, decals = {},
+                    }
+                    if part:IsA("MeshPart") then
+                        row.meshId, row.textureId = part.MeshId, part.TextureID
+                    end
+                    local mesh = part:FindFirstChildWhichIsA("SpecialMesh")
+                    if mesh then
+                        row.mesh = {id = mesh.MeshId, texture = mesh.TextureId, type = mesh.MeshType.Name,
+                            scale = {mesh.Scale.X, mesh.Scale.Y, mesh.Scale.Z}, offset = {mesh.Offset.X, mesh.Offset.Y, mesh.Offset.Z}}
+                    end
+                    for _, child in ipairs(part:GetChildren()) do
+                        if child:IsA("Decal") then
+                            table.insert(row.decals, {texture = child.Texture, face = child.Face.Name, transparency = child.Transparency})
+                        elseif child:IsA("SurfaceAppearance") then
+                            row.surface = {ColorMap = child.ColorMap, MetalnessMap = child.MetalnessMap,
+                                NormalMap = child.NormalMap, RoughnessMap = child.RoughnessMap, AlphaMode = child.AlphaMode.Name}
+                        end
+                    end
+                    table.insert(record.parts, row)
+                end
+            end
+            result[kind][id] = record
+        end
+    end
+    return result
+end
+
+local function import_skin_geometry(record)
+    assert(type(record) == "table" and type(record.parts) == "table" and #record.parts > 0 and #record.parts <= 64)
+    assert(type(record.belt) == "table" and #record.belt == 12)
+    local model = Instance.new("Model")
+    local ok, err = pcall(function()
+        for _, row in ipairs(record.parts) do
+            assert(row.class == "Part" or row.class == "MeshPart", "Unsupported geometry")
+            assert(type(row.cf) == "table" and #row.cf == 12)
+            local part = Instance.new(row.class)
+            part.Parent = model
+            part.Name = "Visual"
+            part.Anchored, part.CanCollide, part.CanTouch, part.CanQuery, part.Massless = true, false, false, false, true
+            part.Size = skin_vector(row.size)
+            part.CFrame = CFrame.new(table.unpack(row.cf))
+            part.Color = Color3.new(row.color[1], row.color[2], row.color[3])
+            part.Transparency = row.transparency or 0
+            part.Material = Enum.Material[row.material] or Enum.Material.Plastic
+            if row.class == "MeshPart" then
+                assert(type(sethiddenproperty) == "function", "Mesh property API unavailable")
+                sethiddenproperty(part, "MeshId", row.meshId)
+                assert(part.MeshId == row.meshId and row.meshId ~= "", "Mesh unavailable")
+                part.TextureID = row.textureId or ""
+            end
+            if row.mesh then
+                local mesh = Instance.new("SpecialMesh")
+                mesh.MeshType = Enum.MeshType[row.mesh.type]
+                mesh.MeshId, mesh.TextureId = row.mesh.id, row.mesh.texture
+                mesh.Scale, mesh.Offset = skin_vector(row.mesh.scale), skin_vector(row.mesh.offset)
+                mesh.Parent = part
+            end
+            for _, decal in ipairs(row.decals or {}) do
+                local d = Instance.new("Decal")
+                d.Texture, d.Face, d.Transparency = decal.texture, Enum.NormalId[decal.face], decal.transparency or 0
+                d.Parent = part
+            end
+            if row.surface then
+                local surface = Instance.new("SurfaceAppearance")
+                for _, key in ipairs({"ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap"}) do surface[key] = row.surface[key] or "" end
+                surface.AlphaMode = Enum.AlphaMode[row.surface.AlphaMode]
+                surface.Parent = part
+            end
+            if not model.PrimaryPart then model.PrimaryPart = part end
+        end
+        model:SetAttribute("BeltMount", CFrame.new(table.unpack(record.belt)))
+        if record.hand then model:SetAttribute("HandMount", CFrame.new(table.unpack(record.hand))) end
+        model:SetAttribute("NativeDisplay", true)
+        model.Name = "ZERO_LocalSkin"
+    end)
+    if not ok then model:Destroy(); error(err) end
+    return model
+end
+
+function app.load_skin_library()
+    local function apply_payload(payload)
+        local ok, data = pcall(http.JSONDecode, http, payload)
+        if ok and type(data) == "table" and data.version == 1 then
+            for _, kind in ipairs({"Gun", "Knife"}) do
+                for id, record in pairs(type(data[kind]) == "table" and data[kind] or {}) do
+                    local item = (Sync.Weapons or Sync.Item)[id]
+                    if app.alive and item and item.ItemType == kind then
+                        local loaded, model = pcall(import_skin_geometry, record)
+                        if loaded then register_skin_model(kind, id, model) end
+                        task.wait()
+                    end
+                end
+            end
+        end
+    end
+    if capabilities.isfile and capabilities.readfile then
+        local ok, text = pcall(function() return isfile(skin_cache_file) and readfile(skin_cache_file) end)
+        if ok and type(text) == "string" then apply_payload(text) end
+    end
+    local fetched, public = pcall(function()
+        return game:HttpGet("https://raw.githubusercontent.com/nandox97l/zero-mm2/main/skins.json")
+    end)
+    if fetched and type(public) == "string" then apply_payload(public) end
+end
+
+function app.save_skin_library()
+    if not skin_cache_dirty or not capabilities.writefile or env.ZERO_MM2_TEST then return end
+    local ok = pcall(function() writefile(skin_cache_file, http:JSONEncode(app.export_skin_library())) end)
+    if ok then skin_cache_dirty = false end
 end
 
 local function restore_skin_hidden(kind)
@@ -1301,6 +1483,7 @@ local function update_skin(kind)
     if selection == "Original" and app.settings.skin_style == "Original" and app.settings.skin_effect == "None" then
         clear_skin(kind)
         skin_messages[kind] = "Original"
+        app.skin_status = "Gun: " .. skin_messages.Gun .. " | Knife: " .. skin_messages.Knife
         return
     end
     local stamp = tostring(app.skin_revision) .. selection .. app.settings.skin_style .. app.settings.skin_effect .. tostring(app.settings.skin_color)
@@ -1358,20 +1541,23 @@ local function update_skin(kind)
                 end
             end
         end
-        local hand_mount = model:GetAttribute("HandMount") or native_grips[kind] or target_mount
-        local correction = target_mount * hand_mount:Inverse()
-        local body = rigid and (rigid.Attachment0 and rigid.Attachment0.Parent)
-        if body and body:IsDescendantOf(target) then body = rigid.Attachment1 and rigid.Attachment1.Parent end
-        local belt_offset
-        if body and body:IsA("BasePart") and model:GetAttribute("NativeDisplay") then
-            belt_offset = CFrame.new(model:GetAttribute("BeltPosition") * body.Size)
-                * model:GetAttribute("BeltRotation") * model:GetAttribute("BeltMount"):Inverse()
+        local hand_mount = model:GetAttribute("HandMount")
+        local correction = target_mount * (hand_mount or target_mount):Inverse()
+        local body_attachment
+        if rigid then
+            for _, attachment in ipairs({rigid.Attachment0, rigid.Attachment1}) do
+                if attachment and not attachment:IsDescendantOf(target) and attachment.Parent then
+                    body_attachment = attachment
+                    break
+                end
+            end
         end
-        overlay = {model = model, target = target, stamp = stamp, correction = correction, body = body, belt_offset = belt_offset}
+        overlay = {model = model, target = target, stamp = stamp, correction = correction,
+            body_attachment = body_attachment, belt_mount = model:GetAttribute("BeltMount")}
         skin_overlays[kind] = overlay
     end
-    if overlay.belt_offset and overlay.body and overlay.body.Parent then
-        overlay.model:PivotTo(overlay.body.CFrame * overlay.belt_offset)
+    if overlay.belt_mount and overlay.body_attachment and overlay.body_attachment.Parent then
+        overlay.model:PivotTo(overlay.body_attachment.WorldCFrame * overlay.belt_mount:Inverse())
     else
         overlay.model:PivotTo(part.CFrame * overlay.correction)
     end
@@ -1480,6 +1666,7 @@ function app.extra_render(dt)
         extras_elapsed = 0
         if app.settings.anti_afk then app.set_anti_afk(true) end
         app.refresh_skin_catalog()
+        app.save_skin_library()
     end
 end
 connect(UserInputService.WindowFocused, function() app.focused = true end)
@@ -1747,7 +1934,7 @@ local translations = {pt = {
     ["Round"]="Ronda",["Clips"]="Clipes",["Health bar"]="Barra de vida",["Streamer mode"]="Modo streamer",
     ["Choose a gun"]="Escolher pistola",["Choose a knife"]="Escolher faca",["Bomb double jump"]="Salto duplo com bomba",
     ["Spin and shoot"]="Girar e disparar",["Cancel clip"]="Cancelar clipe",["Rotation speed"]="Velocidade do giro",
-    ["Only loaded models appear. Refresh to discover newly replicated skins."]="Apenas modelos carregados. Atualiza para encontrar novas skins disponíveis.",
+    ["Only validated models appear. The shared library and local cache work across servers."]="Apenas modelos validados. A biblioteca partilhada e a cache local funcionam entre servidores.",
     ["Skeleton"]="Esqueleto", ["Trigger bot"]="Disparo ao passar a mira", ["Kill all as Murderer"]="Eliminar todos como Murderer", ["Murderer role required"]="É preciso ser o Murderer",
     ["UI library"]="Biblioteca da interface", ["Gun A–Z"]="Pistolas A–Z", ["Knife A–Z"]="Facas A–Z",
     ["Local skins"] = "Skins locais", ["Target player"] = "Jogador alvo", ["Refresh players"] = "Atualizar jogadores",
@@ -1942,6 +2129,7 @@ function app.open_gallery(kind)
         label.Parent=tile
         tile.Activated:Connect(function()
             app.settings[key]=name
+            if app.pending_skins then app.pending_skins[kind]=nil end
             if name~="Original" then set_enabled("skins",true) end
             if capabilities.writefile and not env.ZERO_MM2_TEST then
                 pcall(writefile,"ZERO-MM2-skins.json",http:JSONEncode({Gun=app.settings.gun_skin,Knife=app.settings.knife_skin}))
@@ -2297,7 +2485,11 @@ local function build_ui()
             if isfile("ZERO-MM2-skins.json") then
                 local prefs=http:JSONDecode(readfile("ZERO-MM2-skins.json"))
                 for _,kind in ipairs({"Gun","Knife"}) do
-                    if table.find(catalog[kind],prefs[kind]) then app.settings[kind:lower().."_skin"]=prefs[kind] end
+                    if table.find(catalog[kind],prefs[kind]) then app.settings[kind:lower().."_skin"]=prefs[kind]
+                    elseif type(prefs[kind]) == "string" then
+                        app.pending_skins = app.pending_skins or {}
+                        app.pending_skins[kind] = prefs[kind]
+                    end
                 end
             end
         end)
@@ -2314,7 +2506,7 @@ local function build_ui()
         callback = function(color) app.settings.skin_color = color end})
     skins:CreateButton({name = "Refresh skin catalog", callback = function() app.refresh_skin_catalog(true) end})
     skins:CreateButton({name = "Restore original visuals", callback = function() set_enabled("skins", false) end})
-    skins:CreateText({text = "Only loaded models appear. Refresh to discover newly replicated skins."})
+    skins:CreateText({text = "Only validated models appear. The shared library and local cache work across servers."})
     app.skin_text = skins:CreateText({name = "Status", text = "Original"})
 
     local boxes = tabs.Boxes
@@ -2486,4 +2678,5 @@ connect(RunService.RenderStepped, function(dt)
     if not ok then app.runtime_failures.troll = tostring(err); report_error("Render", err) end
 end)
 app.window:Notify({title = "ZERO MM2 pronto", content = "Ctrl direito: menu. F: voo. Preferencias guardadas em Configuracoes."})
+task.spawn(app.load_skin_library)
 return app.diagnostics()
