@@ -28,7 +28,7 @@ local app: any = {
     stats = { frames = 0, aim_moves = 0, silent_calls = 0, collected_events = 0, collected = 0 },
     settings = {
         esp = false, boxes = true, names = true, chams = true, lobby = false,
-        skeleton = false, trigger = false, gun_esp = false, coin_esp = false, aim = false, silent = false,
+        health_bar = false, streamer = false, spin_speed_clip = 240, skeleton = false, trigger = false, gun_esp = false, coin_esp = false, aim = false, silent = false,
         fov_circle = false, fov = 180, smoothing = 8, prediction = 0,
         wall_check = true, target_mode = "By role", target_part = "HumanoidRootPart",
         farm = false, farm_mode = "Normal", farm_speed = 14,
@@ -160,6 +160,8 @@ function app.destroy()
     if not app.alive then return end
     app.alive = false
     app.box_running = false
+    if app.stop_clip then app.stop_clip() end
+    if app.set_stream then app.set_stream(false) end
     if app.cleanup_extras then app.cleanup_extras() end
     if app.restore_movement then app.restore_movement() end
     if app.launcher then app.launcher:Destroy() end
@@ -216,6 +218,14 @@ local function player_role(player)
     return data.Role or "Innocent"
 end
 
+local aliases = setmetatable({}, {__mode="k"})
+local alias_count=0
+local function identity(player)
+    if not app.settings.streamer then return player.DisplayName end
+    if player == local_player then return "Player" end
+    if not aliases[player] then alias_count+=1; aliases[player]=string.format("Player %02d",alias_count) end
+    return aliases[player]
+end
 app.player_role = player_role
 app.active_player = active_player
 
@@ -287,7 +297,7 @@ for _, key in ipairs({"GetMouseTargetCFrame", "GetTargetPosition"}) do
     local original = WeaponService[key]
     if type(original) ~= "function" then app.module_ready.weapon = false else
     local wrapper = function(self, ...)
-        if app.alive and equipped_weapon() and (app.finish_active or (app.settings.silent and math.random(1, 100) <= app.settings.hit_chance)) then
+        if app.alive and equipped_weapon() and (app.finish_active or os.clock() < (app.clip_target_until or 0) or (app.settings.silent and math.random(1, 100) <= app.settings.hit_chance)) then
             local target = app.finish_active and app.forced_target or (app.trigger_target and os.clock() < app.trigger_until and app.trigger_target) or app.select_target()
             if target and not active_player(target.player) then target = nil end
             if target then
@@ -361,6 +371,8 @@ local function add_player(player)
     highlight.Parent = app.ui_parent()
     app.visuals[player] = {
         highlight = highlight,
+        hp_track = draw("Line", {Thickness=4, Color=Color3.fromRGB(24,24,30), Visible=false, Transparency=1}),
+        hp_fill = draw("Line", {Thickness=2, Visible=false, Transparency=1}),
         tracer = draw("Line", {Thickness = 1, Transparency = 1, Visible = false}),
         box = draw("Square", {Thickness = 1, Filled = false, Transparency = 1, Visible = false}),
         text = draw("Text", {Size = 15, Center = true, Outline = true, Visible = false}),
@@ -373,6 +385,7 @@ connect(Players.PlayerRemoving, function(player)
     if visual then
         visual.highlight:Destroy()
         local handles = visual.bones or {}
+        table.insert(handles,visual.hp_track); table.insert(handles,visual.hp_fill)
         table.insert(handles,visual.box); table.insert(handles,visual.text); table.insert(handles,visual.tracer)
         for _, object in ipairs(handles) do
             object:Remove()
@@ -505,6 +518,7 @@ local function set_enabled(key, value)
 end
 
 function app.stop_all()
+    if app.stop_clip then app.stop_clip() end
     app.finish_active, app.pickup_requested, app.box_running, app.troll_fling_active = false, false, false, false
     for _, key in ipairs({"esp", "gun_esp", "coin_esp", "aim", "silent", "trigger", "farm", "xp_farm",
         "flight", "noclip", "speed_enabled", "jump_enabled", "auto_gun", "infinite_jump",
@@ -688,7 +702,7 @@ local function fling_step(target, dt)
     app.stats.last_fling_peak_speed = fling_state.peak_speed
     app.stats.last_fling_displacement = (target_root.Position - fling_state.target_origin).Magnitude
     app.stats.last_fling_vertical = target_root.Position.Y - fling_state.target_origin.Y
-    app.farm_status = "Fling: " .. target.DisplayName
+    app.farm_status = "Fling: " .. identity(target)
     local outside = false
     if fling_state.bounds then
         local pos = fling_state.bounds:PointToObjectSpace(target_root.Position)
@@ -787,7 +801,27 @@ local function finish_step(dt)
         return pickup_step(dt)
     end
     if tool.Parent ~= local_player.Character then humanoid:EquipTool(tool) end
-    app.farm_status = "Finish round: " .. target.DisplayName
+    app.farm_status = "Finish round: " .. identity(target)
+    if role == "Murderer" and app.finish_murder_only then
+        end_motion()
+        if os.clock()-last_attack >= 1 then
+            last_attack=os.clock()
+            local events=tool:FindFirstChild("Events")
+            local stab=events and events:FindFirstChild("KnifeStabbed")
+            local touch=events and events:FindFirstChild("HandleTouched")
+            if stab and touch then
+                stab:FireServer()
+                for _,enemy in ipairs(Players:GetPlayers()) do
+                    if enemy~=local_player and active_player(enemy) then
+                        local body,torso=character_parts(enemy)
+                        touch:FireServer(body:FindFirstChild("UpperTorso") or torso)
+                        app.stats.stabs+=1
+                    end
+                end
+            end
+        end
+        return true
+    end
     if role == "Murderer" then
         local arrived = move_to(target_root.Position + target_root.CFrame.LookVector * -2, dt, "combat", false, false)
         if arrived and os.clock() - last_attack > 0.9 then
@@ -1033,8 +1067,9 @@ function app.set_anti_afk(enabled)
     return true
 end
 
+local target_options = {}
 local function target_player()
-    local selected = Players:FindFirstChild(app.settings.troll_target)
+    local selected = target_options[app.settings.troll_target]
     if not selected or selected == local_player then return nil end
     local _, root, humanoid = character_parts(selected)
     return root and humanoid and humanoid.Health > 0 and selected or nil
@@ -1042,7 +1077,14 @@ end
 
 function app.refresh_targets()
     local options = {"None"}
-    for _, player in ipairs(Players:GetPlayers()) do if player ~= local_player then table.insert(options, player.Name) end end
+    table.clear(target_options)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= local_player then
+            local label=app.settings.streamer and identity(player) or player.Name
+            target_options[label]=player
+            table.insert(options,label)
+        end
+    end
     table.sort(options, function(a, b)
         if a == b then return false end
         if a == "None" then return true elseif b == "None" then return false end
@@ -1239,26 +1281,34 @@ function app.refresh_skin_catalog(force)
             end
         end
     end
-    if force == true then table.clear(skin_loads) end
-    if app.skin_catalog and #app.skin_catalog.Knife + #app.skin_catalog.Gun > 2 then return app.skin_catalog end
+    if force == true then
+        table.clear(skin_loads)
+        app.skin_catalog = nil
+    end
+    if app.skin_catalog then return app.skin_catalog end
     local options = {Knife = {"Original"}, Gun = {"Original"}}
     local weapons = Sync.Weapons or Sync.Item or {}
-    local counts = {Gun = {}, Knife = {}}
-    for id, item in pairs(weapons) do
-        local names = counts[item.ItemType]
-        local name = item.ItemName or id
-        if names then names[name] = (names[name] or 0) + 1 end
-    end
-    for id, item in pairs(weapons) do
-        local kind, name = item.ItemType, item.ItemName or id
-        if options[kind] then
-            local label = counts[kind][name] > 1 and (name .. " [" .. id .. "]") or name
-            catalog_ids[kind][label] = id
-            table.insert(options[kind], label)
+    local counts = {Knife = {}, Gun = {}}
+    for _, item in pairs(weapons) do
+        if type(item) == "table" and counts[item.ItemType] then
+            local name = tostring(item.ItemName or "Unknown")
+            counts[item.ItemType][name] = (counts[item.ItemType][name] or 0) + 1
         end
     end
-    table.sort(options.Gun)
-    table.sort(options.Knife)
+    for _, kind in ipairs({"Knife", "Gun"}) do
+        table.clear(catalog_ids[kind])
+        local labels = {}
+        for id, item in pairs(weapons) do
+            if type(item) == "table" and item.ItemType == kind then
+                local name = tostring(item.ItemName or id)
+                local label = (counts[kind][name] > 1 or name == "Original") and (name .. " [" .. tostring(id) .. "]") or name
+                catalog_ids[kind][label] = id
+                table.insert(labels, label)
+            end
+        end
+        table.sort(labels)
+        for _, label in ipairs(labels) do table.insert(options[kind], label) end
+    end
     app.skin_catalog = options
     return options
 end
@@ -1450,8 +1500,8 @@ connect(Players.PlayerRemoving, function() task.defer(app.refresh_targets) end)
 
 local trigger_params = RaycastParams.new()
 trigger_params.FilterType = Enum.RaycastFilterType.Exclude
-local function trigger_step(camera, cursor)
-    if not app.settings.trigger or app.finish_active or not app.has_focus() or UserInputService:GetFocusedTextBox() then return end
+local function trigger_step(camera, cursor, clip)
+    if (not clip and not app.settings.trigger) or app.finish_active or not app.has_focus() or UserInputService:GetFocusedTextBox() then return end
     local gun = equipped_weapon()
     if not gun or gun.Name ~= "Gun" or not active_player(local_player) or os.clock()-last_attack < 3.1 then return end
     trigger_params.FilterDescendantsInstances = {local_player.Character, camera}
@@ -1462,10 +1512,112 @@ local function trigger_step(camera, cursor)
     if target and eligible_target(target) then
         app.trigger_target = {player=target,part=hit.Instance}
         app.trigger_until = os.clock()+0.15
+        if clip then app.clip_target_until = app.trigger_until end
         last_attack=os.clock()
         gun:Activate()
         app.stats.trigger_shots=(app.stats.trigger_shots or 0)+1
+        return true
     end
+    return false
+end
+
+local stream_core = {}
+function app.set_stream(enabled)
+    local was = app.settings.streamer
+    app.settings.streamer = enabled == true
+    local starter = game:GetService("StarterGui")
+    for _,key in ipairs({Enum.CoreGuiType.Chat,Enum.CoreGuiType.PlayerList}) do
+        if enabled and stream_core[key]==nil then
+            local ok,visible=pcall(starter.GetCoreGuiEnabled,starter,key)
+            if ok then
+                stream_core[key]=visible
+                pcall(starter.SetCoreGuiEnabled,starter,key,false)
+            end
+        elseif not enabled and stream_core[key]~=nil then
+            pcall(starter.SetCoreGuiEnabled,starter,key,stream_core[key])
+            stream_core[key]=nil
+        end
+    end
+    if was~=enabled and app.alive then
+        app.settings.troll_target="None"
+        app.refresh_targets()
+        if app.controls.troll_target then app.controls.troll_target:Set("None") end
+    end
+end
+
+local bomb_ready=0
+function app.stop_clip()
+    local spin=app.clip_spin
+    app.clip_spin=nil
+    if spin and spin.camera.Parent then
+        spin.camera.CFrame=spin.start
+        spin.camera.CameraType=spin.mode
+    end
+    local bomb=app.clip_bomb
+    app.clip_bomb=nil
+    if bomb and bomb.tool.Parent==bomb.character then
+        bomb.tool.Parent=bomb.folder
+        if bomb.previous and bomb.previous.Parent and bomb.humanoid.Health>0 then bomb.humanoid:EquipTool(bomb.previous) end
+    end
+end
+
+function app.bomb_jump()
+    if os.clock()<bomb_ready then return false,string.format("%.0fs",math.ceil(bomb_ready-os.clock())) end
+    local character,root,humanoid=character_parts(local_player)
+    local backpack=local_player:FindFirstChildOfClass("Backpack")
+    local toy=character and character:FindFirstChild("FakeBomb") or backpack and backpack:FindFirstChild("FakeBomb",true)
+    if not root or not humanoid or humanoid.Health<=0 or not toy or not toy:IsA("Tool") or not toy:FindFirstChild("Remote") then return false,"FakeBomb indisponível / unavailable" end
+    if humanoid.FloorMaterial==Enum.Material.Air then return false,"Começa no chão / start on the ground" end
+    app.stop_clip()
+    local state={tool=toy,folder=toy.Parent==character and backpack or toy.Parent,previous=character:FindFirstChildOfClass("Tool"),character=character,humanoid=humanoid}
+    app.clip_bomb=state
+    if toy.Parent~=character then toy.Parent=backpack;humanoid:EquipTool(toy) end
+    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    task.spawn(function()
+        local start=os.clock()
+        repeat RunService.Heartbeat:Wait() until app.clip_bomb~=state or not root.Parent or os.clock()-start>.55 or (os.clock()-start>.1 and root.AssemblyLinearVelocity.Y<5)
+        if app.clip_bomb~=state then return end
+        if not root.Parent or humanoid.Health<=0 or toy.Parent~=character then app.stop_clip();return end
+        bomb_ready=os.clock()+22
+        toy.Remote:FireServer(CFrame.new(root.Position-Vector3.yAxis*3),50)
+        local v=root.AssemblyLinearVelocity
+        local jump=humanoid.UseJumpPower and humanoid.JumpPower or math.sqrt(2*workspace.Gravity*humanoid.JumpHeight)
+        root.AssemblyLinearVelocity=Vector3.new(v.X,math.max(v.Y,jump),v.Z)
+        app.stats.bomb_jump_velocity=root.AssemblyLinearVelocity.Y
+        task.wait(.35)
+        if app.clip_bomb==state then app.stop_clip() end
+    end)
+    return true
+end
+
+function app.start_spin()
+    local gun=has_weapon(local_player,"Gun")
+    local _,root,humanoid=character_parts(local_player)
+    local camera=workspace.CurrentCamera
+    if not gun or not root or not humanoid or not camera or not active_player(local_player) then return false,"É preciso uma pistola na ronda / gun required" end
+    app.stop_clip()
+    if gun.Parent~=local_player.Character then humanoid:EquipTool(gun) end
+    app.clip_spin={start=camera.CFrame, mode=camera.CameraType,camera=camera,root=root,origin=root.Position,angle=0}
+    camera.CameraType=Enum.CameraType.Scriptable
+    return true
+end
+
+function app.spin_step(camera,dt)
+    local state=app.clip_spin
+    if state.camera~=camera or not state.root.Parent or not active_player(local_player) or not app.has_focus() then app.stop_clip();return end
+    local finish=math.min(360,state.angle+app.settings.spin_speed_clip*math.min(dt,.08))
+    local steps=math.max(1,math.ceil((finish-state.angle)/1.5))
+    for i=1,steps do
+        local yaw=math.rad(state.angle+(finish-state.angle)*i/steps)
+        camera.CFrame=CFrame.new(state.start.Position+state.root.Position-state.origin)*CFrame.Angles(0,yaw,0)*state.start.Rotation
+        if trigger_step(camera,camera.ViewportSize/2,true) then
+            app.stats.clip_shots=(app.stats.clip_shots or 0)+1
+            app.stop_clip()
+            return
+        end
+    end
+    state.angle=finish
+    if finish>=360 then app.stop_clip() end
 end
 
 function app.render_step(dt)
@@ -1475,7 +1627,7 @@ function app.render_step(dt)
     app.stats.frames += 1
     app.extra_render(dt)
     local cursor = cursor_position(camera)
-    trigger_step(camera,cursor)
+    if app.clip_spin then app.spin_step(camera,dt) else trigger_step(camera,cursor) end
     fov.Color = app.settings.fov_color
     fov.Position = cursor
     fov.Radius = app.settings.fov
@@ -1489,6 +1641,7 @@ function app.render_step(dt)
             and (camera.CFrame.Position - root.Position).Magnitude <= app.settings.esp_distance
             and (not app.settings.esp_visible or visible_target(root, camera))
         skeleton_step(visual,character,camera,show and app.settings.skeleton,colors[role] or colors.Innocent)
+        visual.hp_track.Visible, visual.hp_fill.Visible = false, false
         visual.tracer.Visible = false
         visual.box.Visible = false
         visual.text.Visible = false
@@ -1504,6 +1657,15 @@ function app.render_step(dt)
             if on_screen and bottom.Z > 0 then
                 local height = math.abs(bottom.Y - top.Y)
                 local width = height * 0.58
+                if app.settings.health_bar then
+                    local ratio=math.clamp(humanoid.Health/math.max(1,humanoid.MaxHealth),0,1)
+                    local x=top.X-width/2-5
+                    local y=math.max(top.Y,bottom.Y)
+                    visual.hp_track.From,visual.hp_track.To=Vector2.new(x,y),Vector2.new(x,y-height)
+                    visual.hp_fill.From,visual.hp_fill.To=visual.hp_track.From,Vector2.new(x,y-height*ratio)
+                    visual.hp_fill.Color=Color3.fromHSV(ratio/3,0.85,0.95)
+                    visual.hp_track.Visible,visual.hp_fill.Visible=true,ratio>0
+                end
                 visual.box.Position = Vector2.new(top.X - width / 2, math.min(top.Y, bottom.Y))
                 visual.box.Size = Vector2.new(width, height)
                 visual.box.Thickness = app.settings.line_thickness
@@ -1511,7 +1673,7 @@ function app.render_step(dt)
                 visual.box.Visible = app.settings.boxes
                 visual.text.Position = Vector2.new(top.X, math.min(top.Y, bottom.Y) - 18)
                 local caption = {}
-                if app.settings.names then table.insert(caption, player.DisplayName) end
+                if app.settings.names then table.insert(caption, identity(player)) end
                 if app.settings.role_labels then table.insert(caption, app.settings.locale == "pt" and (role_names[role] or role) or role) end
                 if app.settings.distance_labels then table.insert(caption, string.format("%.0fm", (camera.CFrame.Position - root.Position).Magnitude / 3.57)) end
                 if app.settings.health then table.insert(caption, string.format("HP %.0f", humanoid.Health)) end
@@ -1555,7 +1717,7 @@ function app.render_step(dt)
         end
     end
     app.target = nil
-    if app.settings.aim and app.aim_pressed()
+    if not app.clip_spin and app.settings.aim and app.aim_pressed()
         and not UserInputService:GetFocusedTextBox() and app.has_focus() then
         local target = app.select_target()
         app.target = target
@@ -1592,6 +1754,10 @@ function app.diagnostics()
 end
 
 local translations = {pt = {
+    ["Round"]="Ronda",["Clips"]="Clipes",["Health bar"]="Barra de vida",["Streamer mode"]="Modo streamer",
+    ["Choose a gun"]="Escolher pistola",["Choose a knife"]="Escolher faca",["Bomb double jump"]="Salto duplo com bomba",
+    ["Spin and shoot"]="Girar e disparar",["Cancel clip"]="Cancelar clipe",["Rotation speed"]="Velocidade do giro",
+    ["Full catalog. Search and choose a thumbnail to apply its local model."]="Escolhe uma miniatura para aplicar o modelo local.",
     ["Skeleton"]="Esqueleto", ["Trigger bot"]="Disparo ao passar a mira", ["Kill all as Murderer"]="Eliminar todos como Murderer", ["Murderer role required"]="É preciso ser o Murderer",
     ["UI library"]="Biblioteca da interface", ["Gun A–Z"]="Pistolas A–Z", ["Knife A–Z"]="Facas A–Z",
     ["Local skins"] = "Skins locais", ["Target player"] = "Jogador alvo", ["Refresh players"] = "Atualizar jogadores",
@@ -1604,7 +1770,6 @@ local translations = {pt = {
     ["Local skin changer"] = "Skins locais", ["Knife model"] = "Modelo da faca", ["Gun model"] = "Modelo da pistola",
     ["Material / style"] = "Material / estilo", ["Local effect"] = "Efeito local", ["Skin color"] = "Cor da skin",
     ["Refresh skin catalog"] = "Atualizar catalogo de skins", ["Restore original visuals"] = "Restaurar visual original",
-    ["Complete MM2 catalog. Models load on selection from the game or the Creator Store. Unavailable models are marked."] = "Modelos de armas ja carregadas neste servidor. Alteracoes visiveis apenas para ti; o inventario nao muda.",
     ["Local visuals active"] = "Visuais locais ativos", ["Selected skin is not loaded in this server"] = "Skin selecionada nao carregada neste servidor",
     ["Following target"] = "A seguir alvo", ["Orbiting target"] = "A orbitar alvo", ["Load status"] = "Estado do carregamento",
     ["Executor compatibility"] = "Compatibilidade do executor", ["All modules loaded"] = "Todos os modulos carregados",
@@ -1664,6 +1829,148 @@ local function tr(text)
     return text
 end
 app.translate = tr
+function app.open_gallery(kind)
+    if app.gallery then app.gallery:Destroy() end
+    local layer=Instance.new("Frame")
+    layer.Name="SkinGallery"
+    layer.Size=UDim2.fromScale(1,1)
+    layer.BackgroundColor3=Color3.new(0,0,0)
+    layer.BackgroundTransparency=.35
+    layer.Active=true
+    layer.ZIndex=10
+    layer.Parent=app.launcher
+    app.gallery=layer
+    local frame=Instance.new("Frame")
+    frame.Size=UDim2.fromScale(.85,.76)
+    local limit=Instance.new("UISizeConstraint")
+    limit.MaxSize=Vector2.new(660,510)
+    limit.Parent=frame
+    frame.AnchorPoint=Vector2.new(.5,.5)
+    frame.Position=UDim2.fromScale(.5,.5)
+    frame.BackgroundColor3=Color3.fromRGB(25,30,43)
+    frame.ZIndex=11
+    frame.Parent=layer
+    Instance.new("UICorner",frame).CornerRadius=UDim.new(0,12)
+    local title=Instance.new("TextLabel")
+    title.Size=UDim2.new(1,-62,0,46)
+    title.Position=UDim2.fromOffset(16,0)
+    title.BackgroundTransparency=1
+    title.TextColor3=Color3.fromRGB(240,243,251)
+    title.TextXAlignment=Enum.TextXAlignment.Left
+    title.Font=Enum.Font.GothamBold
+    title.TextSize=19
+    title.Text=tr(kind=="Gun" and "Choose a gun" or "Choose a knife")
+    title.ZIndex=12
+    title.Parent=frame
+    local close=Instance.new("TextButton")
+    close.Name="Close"
+    close.Size=UDim2.fromOffset(36,30)
+    close.Position=UDim2.new(1,-44,0,8)
+    close.Text="×"
+    close.TextSize=22
+    close.TextColor3=Color3.new(1,1,1)
+    close.BackgroundColor3=Color3.fromRGB(50,55,72)
+    close.ZIndex=12
+    close.Parent=frame
+    close.Activated:Connect(function() layer:Destroy();app.gallery=nil end)
+    local search=Instance.new("TextBox")
+    search.Name="Search"
+    search.PlaceholderText=app.settings.language=="Portuguese" and "Pesquisar skins" or "Search skins"
+    search.Text=""
+    search.ClearTextOnFocus=false
+    search.Size=UDim2.new(1,-24,0,30)
+    search.Position=UDim2.fromOffset(12,46)
+    search.TextColor3=Color3.new(1,1,1)
+    search.BackgroundColor3=Color3.fromRGB(39,45,62)
+    search.ZIndex=12
+    search.Parent=frame
+    local footer=Instance.new("TextButton")
+    footer.Name="NextPage"
+    footer.Size=UDim2.new(1,-24,0,28)
+    footer.Position=UDim2.new(0,12,1,-32)
+    footer.TextColor3=Color3.new(1,1,1)
+    footer.BackgroundColor3=Color3.fromRGB(39,45,62)
+    footer.ZIndex=12
+    footer.Parent=frame
+    local scroll=Instance.new("ScrollingFrame")
+    scroll.Size=UDim2.new(1,-24,1,-120)
+    scroll.Position=UDim2.fromOffset(12,82)
+    scroll.BackgroundTransparency=1
+    scroll.BorderSizePixel=0
+    scroll.ScrollBarThickness=4
+    scroll.CanvasSize=UDim2.new()
+    scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    scroll.ZIndex=12
+    scroll.Parent=frame
+    local grid=Instance.new("UIGridLayout")
+    grid.CellSize=UDim2.new(.32,-4,0,106)
+    grid.CellPadding=UDim2.fromOffset(6,6)
+    grid.SortOrder=Enum.SortOrder.LayoutOrder
+    grid.Parent=scroll
+    local key=kind:lower().."_skin"
+    local page=1
+    local function render()
+        for _, child in ipairs(scroll:GetChildren()) do
+            if child:IsA("GuiObject") then child:Destroy() end
+        end
+        local matches={}
+        local query=search.Text:lower()
+        for _, name in ipairs(app.skin_catalog[kind]) do
+            if name:lower():find(query,1,true) then table.insert(matches,name) end
+        end
+        local pages=math.max(1,math.ceil(#matches/30))
+        page=math.clamp(page,1,pages)
+        footer.Text=string.format("%d / %d · %d skins   >",page,pages,#matches)
+        scroll.CanvasPosition=Vector2.zero
+        for i=(page-1)*30+1,math.min(page*30,#matches) do
+        local name=matches[i]
+        local id=catalog_ids[kind][name] or ("Default"..kind)
+        local item=(Sync.Weapons or Sync.Item)[id]
+        local tile=Instance.new("ImageButton")
+        tile.Name=name
+        tile.LayoutOrder=name=="Original" and 0 or i
+        tile.BackgroundColor3=app.settings[key]==name and Color3.fromRGB(43,79,116) or Color3.fromRGB(39,45,62)
+        tile.ScaleType=Enum.ScaleType.Fit
+        tile.Image=item and (tostring(item.Image or ""):match("^rbxassetid://%d+") or ("rbxthumb://type=Asset&id="..tostring(item.ItemID).."&w=150&h=150")) or ""
+        tile.ZIndex=13
+        tile.Parent=scroll
+        Instance.new("UICorner",tile).CornerRadius=UDim.new(0,8)
+        local label=Instance.new("TextLabel")
+        label.Size=UDim2.new(1,0,0,24)
+        label.Position=UDim2.new(0,0,1,-24)
+        label.BackgroundColor3=Color3.fromRGB(23,27,37)
+        label.BackgroundTransparency=.12
+        label.TextColor3=Color3.new(1,1,1)
+        label.Font=Enum.Font.GothamMedium
+        label.TextSize=13
+        label.Text=name
+        label.ZIndex=14
+        label.Parent=tile
+        tile.Activated:Connect(function()
+            app.settings[key]=name
+            if name~="Original" then set_enabled("skins",true) end
+            if capabilities.writefile and not env.ZERO_MM2_TEST then
+                pcall(writefile,"ZERO-MM2-skins.json",http:JSONEncode({Gun=app.settings.gun_skin,Knife=app.settings.knife_skin}))
+            end
+            layer:Destroy()
+            app.gallery=nil
+        end)
+        end
+    end
+    search:GetPropertyChangedSignal("Text"):Connect(function() page=1;render() end)
+    footer.Activated:Connect(function()
+        page+=1
+        local query=search.Text:lower()
+        local count=0
+        for _, name in ipairs(app.skin_catalog[kind]) do
+            if name:lower():find(query,1,true) then count+=1 end
+        end
+        if page>math.max(1,math.ceil(count/30)) then page=1 end
+        render()
+    end)
+    render()
+end
+
 local libraries = {"WindUI", "Rayfield Gen2", "Fluent"}
 local gui_file = "ZERO-MM2-library.txt"
 local library_name = "WindUI"
@@ -1805,7 +2112,7 @@ local function build_ui()
     app.window = window
     app.module_ready.ui = true
     local tabs = {}
-    for _, name in ipairs({"Player", "Aimbot", "Visuals", "Farm", "Movement", "Troll", "Skins", "Boxes", "Settings", "About"}) do
+    for _, name in ipairs({"Player", "Aimbot", "Visuals", "Round", "Farm", "Movement", "Clips", "Troll", "Skins", "Boxes", "Settings", "About"}) do
         tabs[name] = window:CreateTab({name = name})
     end
     app.tabs = tabs
@@ -1854,6 +2161,7 @@ local function build_ui()
     avatar.BorderSizePixel = 0
     avatar.Position, avatar.Size = UDim2.fromOffset(18, 20), UDim2.fromOffset(108, 108)
     avatar.Parent = panel
+    app.avatar = avatar
     local avatar_corner = Instance.new("UICorner"); avatar_corner.CornerRadius = UDim.new(0, 10); avatar_corner.Parent = avatar
     task.spawn(function()
         local ok, url = pcall(Players.GetUserThumbnailAsync, Players, local_player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size180x180)
@@ -1907,7 +2215,7 @@ local function build_ui()
         callback = function(value) app.settings.fov_color = value end})
     local visual = tabs.Visuals
     for _, spec in ipairs({{"esp", "Role ESP"}, {"boxes", "Boxes"}, {"names", "Player names"}, {"role_labels", "Role labels"},
-        {"skeleton", "Skeleton"}, {"distance_labels", "Distance labels"}, {"health", "Health"}, {"tracers", "Tracers"}, {"chams", "Highlights"},
+        {"health_bar","Health bar"}, {"skeleton", "Skeleton"}, {"distance_labels", "Distance labels"}, {"health", "Health"}, {"tracers", "Tracers"}, {"chams", "Highlights"},
         {"lobby", "Show lobby"}, {"show_innocents", "Show innocents"}, {"esp_visible", "Visible only"},
         {"gun_esp", "Dropped gun ESP"}, {"coin_esp", "Coin ESP"}}) do toggle(visual, spec[1], spec[2]) end
     slider(visual, "esp_distance", "ESP distance", 20, 1500, 10)
@@ -1931,19 +2239,32 @@ local function build_ui()
     farm:CreateText({text = "A fling attempt lasts 6 seconds and restores physics afterwards."})
     toggle(farm, "xp_farm", "XP farm", "Survives rounds and retreats from the murderer. XP is awarded by the server.", true)
     slider(farm, "xp_distance", "XP escape distance", 15, 100, 5)
-    toggle(farm, "auto_gun", "Auto pickup gun", nil, true)
-    farm:CreateButton({name = "Pick up gun now", callback = function() app.pickup_requested = true end})
-    combat:CreateButton({name = "Kill all as Murderer", callback = function()
+    local round=tabs.Round
+    toggle(round, "auto_gun", "Auto pickup gun", nil, true)
+    round:CreateButton({name = "Pick up gun now", callback = function() app.pickup_requested = true end})
+    round:CreateButton({name = "Kill all as Murderer", callback = function()
         local ok, reason = app.request_finish(true)
         if not ok then window:Notify({title = tr("Kill all as Murderer"), content = tr(reason)}) end
     end})
-    farm:CreateButton({name = "Finish this round", callback = function()
+    round:CreateButton({name = "Finish this round", callback = function()
         local ok, reason = app.request_finish()
         if not ok then window:Notify({title = tr("Finish round"), content = tr(reason)}) end
     end})
-    farm:CreateButton({name = "Stop round action", callback = function()
+    round:CreateButton({name = "Stop round action", callback = function()
         app.finish_active, app.forced_target, app.pickup_requested = false, nil, false; app.restore_movement()
     end})
+    local clips=tabs.Clips
+    local function clip_button(title, action)
+        clips:CreateButton({name=title,callback=function()
+            local ok,reason=action()
+            if not ok then window:Notify({title=tr(title),content=reason}) end
+        end})
+    end
+    clip_button("Bomb double jump",app.bomb_jump)
+    clip_button("Spin and shoot",app.start_spin)
+    slider(clips,"spin_speed_clip","Rotation speed",90,540,15)
+    clips:CreateButton({name="Cancel clip",callback=app.stop_clip})
+    app.controls.streamer=clips:CreateToggle({name="Streamer mode",flag="streamer",value=app.settings.streamer,callback=app.set_stream})
     local movement = tabs.Movement
     toggle(movement, "flight", "Flight", "WASD moves; E rises; Q descends. Fling is a separate round action.", true)
     slider(movement, "flight_speed", "Flight speed", 6, 60, 1)
@@ -1974,33 +2295,21 @@ local function build_ui()
     troll:CreateButton({name = "Stop Troll", callback = app.stop_troll})
     local skins = tabs.Skins
     local catalog = app.refresh_skin_catalog()
+    if not app.load_seconds and capabilities.readfile and capabilities.isfile and not env.ZERO_MM2_TEST then
+        pcall(function()
+            if isfile("ZERO-MM2-skins.json") then
+                local prefs=http:JSONDecode(readfile("ZERO-MM2-skins.json"))
+                for _,kind in ipairs({"Gun","Knife"}) do
+                    if table.find(catalog[kind],prefs[kind]) then app.settings[kind:lower().."_skin"]=prefs[kind] end
+                end
+            end
+        end)
+    end
     toggle(skins, "skins", "Local skin changer")
-    -- Keep the entire catalog accessible without constructing a thousand UI rows on launch.
-    for _, kind in ipairs({"Knife", "Gun"}) do
-        local key = string.lower(kind) .. "_skin"
-        local group_key = key .. "_group"
-        local groups, letters = {}, {}
-        for _, name in ipairs(catalog[kind]) do
-            if name ~= "Original" then
-                local letter = name:sub(1,1):upper()
-                if not groups[letter] then groups[letter] = {"Original"}; table.insert(letters, letter) end
-                table.insert(groups[letter], name)
-            end
-        end
-        if #letters == 0 then letters = {"A"}; groups.A = {"Original"} end
-        table.sort(letters)
-        local initial = app.settings[key]:sub(1,1):upper()
-        local chosen = app.settings[group_key] or (groups[initial] and initial) or letters[1]
-        if not groups[chosen] then chosen = letters[1] end
-        app.settings[group_key] = chosen
-        dropdown(skins, group_key, kind .. " A–Z", letters, function(letter)
-            if app.controls[key] and groups[letter] then app.controls[key]:Refresh(groups[letter]) end
-        end)
-        dropdown(skins, key, kind .. " model", groups[chosen], function(name)
-            if name ~= "Original" and app.load_seconds and not app.rebuilding and not app.settings.skins then
-                set_enabled("skins",true)
-            end
-        end)
+    for _, kind in ipairs({"Knife","Gun"}) do
+        local key=kind:lower().."_skin"
+        if not table.find(catalog[kind],app.settings[key]) then app.settings[key]="Original" end
+        skins:CreateButton({name=kind=="Gun" and "Choose a gun" or "Choose a knife",callback=function() app.open_gallery(kind) end})
     end
     dropdown(skins, "skin_style", "Material / style", {"Original", "Gold", "Neon", "Ice", "Rainbow"})
     dropdown(skins, "skin_effect", "Local effect", {"None", "Fire", "Sparkles", "Smoke", "Trail"})
@@ -2008,7 +2317,7 @@ local function build_ui()
         callback = function(color) app.settings.skin_color = color end})
     skins:CreateButton({name = "Refresh skin catalog", callback = function() app.refresh_skin_catalog(true) end})
     skins:CreateButton({name = "Restore original visuals", callback = function() set_enabled("skins", false) end})
-    skins:CreateText({text = "Complete MM2 catalog. Models load on selection from the game or the Creator Store. Unavailable models are marked."})
+    skins:CreateText({text = "Full catalog. Search and choose a thumbnail to apply its local model."})
     app.skin_text = skins:CreateText({name = "Status", text = "Original"})
 
     local boxes = tabs.Boxes
@@ -2105,6 +2414,7 @@ do
     corner.CornerRadius, corner.Parent = UDim.new(0, 8), button
     connect(button.Activated, function()
         if app.rebuilding then return end
+        if app.gallery then app.gallery:Destroy();app.gallery=nil end
         if app.window.unloaded or not app.dashboard:IsDescendantOf(game) then rebuild_ui(library_name)
         else app.window:ToggleHide() end
     end)
@@ -2128,6 +2438,9 @@ function app.update_dashboard(dt)
     app.stats.ping = ok_ping and ping or nil
     app.stats.xp_delta = (local_player:GetAttribute("XP") or app.stats.xp_start) - app.stats.xp_start
     local labels = app.player_labels
+    labels.name.Text = identity(local_player)
+    labels.username.Text = app.settings.streamer and "" or ("@" .. local_player.Name)
+    app.avatar.Visible = not app.settings.streamer
     labels.fps.Text = string.format("FPS  %.0f", app.stats.fps)
     labels.fps.TextColor3 = app.performance_color(app.stats.fps, false)
     labels.ping.Text = ok_ping and string.format("Ping  %.0f ms", ping) or "Ping  —"
@@ -2136,7 +2449,7 @@ function app.update_dashboard(dt)
     labels.executor.Text = tr("Executor") .. ": " .. tostring(executor_name) .. " " .. tostring(executor_version or "")
     labels.load.Text = tr("Load time") .. string.format(": %.2f s", app.load_seconds)
     labels.xp.Text = tr("Session XP") .. ": " .. app.stats.xp_delta
-    app.status_text:Set(tr(app.farm_status))
+    app.status_text:Set(app.settings.streamer and tr("Streamer mode") or tr(app.farm_status))
     local percent, unavailable = app.refresh_features()
     app.load_text:Set(string.format("%d%% — %s", percent, #unavailable == 0 and tr("All modules loaded") or tr("Disabled modules") .. "\n" .. table.concat(unavailable, "\n")))
     local missing = app.executor_report()
