@@ -1157,6 +1157,8 @@ local function clean_visual_clone(source)
     end
     local primary = cloned:IsA("BasePart") and cloned or model:FindFirstChildWhichIsA("BasePart", true)
     if not primary then model:Destroy(); return nil end
+    local grip = source:FindFirstChild("RightGripAttachment", true) or source:FindFirstChild("CustomAttachment", true)
+    if grip and grip:IsA("Attachment") then mount = primary.CFrame:ToObjectSpace(grip.WorldCFrame) end
     primary.PivotOffset = CFrame.identity
     model:SetAttribute("Mount", mount)
     model.PrimaryPart = primary
@@ -1179,6 +1181,8 @@ local function fetch_skin_model(asset_id, part_name)
             else handle = object:IsA("BasePart") and object or object:FindFirstChild("Handle", true) or object:FindFirstChildWhichIsA("BasePart", true) end
             if handle and handle:IsA("BasePart") then
                 -- Copy only render geometry from external models, never scripts or constraints.
+                local tool = handle:FindFirstAncestorOfClass("Tool")
+                local grip = tool and tool.Grip
                 local visual = handle:Clone()
                 for _, child in ipairs(visual:GetChildren()) do
                     if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance") or child:IsA("Decal")) then child:Destroy()
@@ -1186,8 +1190,11 @@ local function fetch_skin_model(asset_id, part_name)
                 end
                 model = clean_visual_clone(visual)
                 visual:Destroy()
-                local mount = handle:FindFirstChild("CustomAttachment") or handle:FindFirstChild("Attachment")
-                if model and mount and mount:IsA("Attachment") then model:SetAttribute("Mount", mount.CFrame) end
+                local mount = handle:FindFirstChild("RightGripAttachment") or handle:FindFirstChild("CustomAttachment")
+                if model then
+                    if mount and mount:IsA("Attachment") then model:SetAttribute("Mount", mount.CFrame)
+                    elseif grip then model:SetAttribute("Mount", grip) end
+                end
             end
         end
         object:Destroy()
@@ -1366,6 +1373,11 @@ local function update_skin(kind)
     local part = target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart", true)
     if not part then clear_skin(kind); return end
     local selection = app.settings[kind == "Knife" and "knife_skin" or "gun_skin"] or "Original"
+    if selection == "Original" and app.settings.skin_style == "Original" and app.settings.skin_effect == "None" then
+        clear_skin(kind)
+        skin_messages[kind] = "Original"
+        return
+    end
     local stamp = selection .. app.settings.skin_style .. app.settings.skin_effect .. tostring(app.settings.skin_color)
     local overlay = skin_overlays[kind]
     if not overlay or overlay.target ~= target or overlay.stamp ~= stamp then
@@ -1373,13 +1385,14 @@ local function update_skin(kind)
         local template = skin_templates[kind][catalog_ids[kind][selection] or selection]
         if selection ~= "Original" and not template then
             request_skin(kind, selection)
-            app.skin_status = skin_messages[kind]
+            app.skin_status = kind .. ": " .. skin_messages[kind]
             return
         end
         local model = template and template:Clone() or clean_visual_clone(target)
         if not model then app.runtime_failures.skins = "Visual model unavailable"; return end
         if selection ~= "Original" and not template then app.skin_status = "Selected skin is not loaded in this server"
-        else app.skin_status = "Local visuals active" end
+        else skin_messages[kind] = selection .. " — active" end
+        app.skin_status = "Gun: " .. skin_messages.Gun .. " | Knife: " .. skin_messages.Knife
         local style = app.settings.skin_style
         for _, object in ipairs(model:GetDescendants()) do
             if object:IsA("BasePart") and style ~= "Original" then
@@ -1402,16 +1415,25 @@ local function update_skin(kind)
         model:SetAttribute("Skin", selection)
         model:SetAttribute("Kind", kind)
         model.Parent = workspace.CurrentCamera
-        local correction = CFrame.identity
+        local target_mount = CFrame.identity
         local rigid = target:FindFirstChildWhichIsA("RigidConstraint", true)
         if rigid then
             for _, attachment in ipairs({rigid.Attachment1, rigid.Attachment0}) do
                 if attachment and attachment:IsDescendantOf(target) then
-                    correction = part.CFrame:ToObjectSpace(attachment.WorldCFrame) * model:GetAttribute("Mount"):Inverse()
+                    target_mount = part.CFrame:ToObjectSpace(attachment.WorldCFrame)
+                    break
+                end
+            end
+        else
+            local character = local_player.Character
+            for _, joint in ipairs(character and character:GetDescendants() or {}) do
+                if joint:IsA("JointInstance") and joint.Part1 == part and joint.Name == "RightGrip" then
+                    target_mount = joint.C1
                     break
                 end
             end
         end
+        local correction = target_mount * (model:GetAttribute("Mount") or CFrame.identity):Inverse()
         overlay = {model = model, target = target, stamp = stamp, correction = correction}
         skin_overlays[kind] = overlay
     end
@@ -1486,6 +1508,10 @@ function app.extra_render(dt)
         if #messages > 0 then app.skin_status = table.concat(messages, " / ") end
     end
     extras_elapsed += dt
+    if app.settings.skins and (not app.next_skin_scan or os.clock() >= app.next_skin_scan) then
+        app.next_skin_scan = os.clock() + 1
+        app.refresh_skin_catalog()
+    end
     if extras_elapsed >= 10 then
         extras_elapsed = 0
         if app.settings.anti_afk then app.set_anti_afk(true) end
