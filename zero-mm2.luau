@@ -1166,7 +1166,7 @@ local function clean_visual_clone(source)
     if rigid and rigid.Attachment0 and rigid.Attachment1 then
         local own, body = rigid.Attachment1, rigid.Attachment0
         if not own:IsDescendantOf(source) then own, body = body, own end
-        if own:IsDescendantOf(source) and body.Parent:IsA("BasePart") then
+        if own:IsDescendantOf(source) and source:IsA("BasePart") and body.Parent and body.Parent:IsA("BasePart") then
             model:SetAttribute("BeltMount", source.CFrame:ToObjectSpace(own.WorldCFrame))
             model:SetAttribute("BeltPosition", body.Position / body.Parent.Size)
             model:SetAttribute("BeltRotation", body.CFrame.Rotation)
