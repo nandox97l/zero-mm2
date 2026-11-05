@@ -3,7 +3,7 @@
 -- Language: Luau | File: zero-mm2.luau | Runtime: Real | Target: MM2, place 142823291 v1460
 -- UI: WindUI, Rayfield Gen2 or Fluent. Gameplay implementation derived from live v1460 inspection.
 -- Reference: OminousVibes MM2, role-color ESP, GunDrop discovery and velocity prediction patterns.
--- References: EdgeIY/infiniteyield, Zyn-ic/MM2-AutoFarm, fleecewtf/MonoMM2.
+-- References: EdgeIY/infiniteyield, Zyn-ic/MM2-AutoFarm, fleecewtf/MonoMM2, Aluxis/MM2-Utilities.
 -- https://github.com/OminousVibes-Exploit/Scripts/blob/main/Murder%20Mystery%202.lua
 local load_started = os.clock()
 local Players = game:GetService("Players")
@@ -28,7 +28,7 @@ local app: any = {
     stats = { frames = 0, aim_moves = 0, silent_calls = 0, collected_events = 0, collected = 0 },
     settings = {
         esp = false, boxes = true, names = true, chams = true, lobby = false,
-        health_bar = false, streamer = false, spin_speed_clip = 240, skeleton = false, trigger = false, gun_esp = false, coin_esp = false, aim = false, silent = false,
+        cinematic_fov = false, camera_fov = 70, fullbright = false, health_bar = false, streamer = false, spin_speed_clip = 240, skeleton = false, trigger = false, gun_esp = false, coin_esp = false, aim = false, silent = false,
         fov_circle = false, fov = 180, smoothing = 8, prediction = 0,
         wall_check = true, target_mode = "By role", target_part = "HumanoidRootPart",
         farm = false, farm_mode = "Normal", farm_speed = 14,
@@ -163,6 +163,7 @@ function app.destroy()
     if app.stop_clip then app.stop_clip() end
     if app.set_stream then app.set_stream(false) end
     if app.cleanup_extras then app.cleanup_extras() end
+    if app.reset_cinematic then app.reset_cinematic() end
     if app.restore_movement then app.restore_movement() end
     if app.launcher then app.launcher:Destroy() end
     if app.dashboard then app.dashboard:Destroy() end
@@ -522,7 +523,7 @@ function app.stop_all()
     app.finish_active, app.pickup_requested, app.box_running, app.troll_fling_active = false, false, false, false
     for _, key in ipairs({"esp", "gun_esp", "coin_esp", "aim", "silent", "trigger", "farm", "xp_farm",
         "flight", "noclip", "speed_enabled", "jump_enabled", "auto_gun", "infinite_jump",
-        "troll_follow", "troll_orbit", "troll_spin", "troll_spectate", "troll_rainbow", "skins"}) do
+        "troll_follow", "troll_orbit", "troll_spin", "troll_spectate", "troll_rainbow", "skins", "cinematic_fov", "fullbright"}) do
         set_enabled(key, false)
     end
     app.restore_movement()
@@ -1038,6 +1039,7 @@ end
 
 local idle_connections = {}
 local skin_templates = {Knife = {}, Gun = {}}
+local native_grips = {}
 local skin_overlays = {}
 local skin_hidden = {}
 local spectate_original = nil
@@ -1161,138 +1163,56 @@ local function clean_visual_clone(source)
     if grip and grip:IsA("Attachment") then mount = primary.CFrame:ToObjectSpace(grip.WorldCFrame) end
     primary.PivotOffset = CFrame.identity
     model:SetAttribute("Mount", mount)
+    if rigid and rigid.Attachment0 and rigid.Attachment1 then
+        local own, body = rigid.Attachment1, rigid.Attachment0
+        if not own:IsDescendantOf(source) then own, body = body, own end
+        if own:IsDescendantOf(source) and body.Parent:IsA("BasePart") then
+            model:SetAttribute("BeltMount", source.CFrame:ToObjectSpace(own.WorldCFrame))
+            model:SetAttribute("BeltPosition", body.Position / body.Parent.Size)
+            model:SetAttribute("BeltRotation", body.CFrame.Rotation)
+            model:SetAttribute("NativeDisplay", true)
+        end
+    end
     model.PrimaryPart = primary
     model:PivotTo(CFrame.identity)
     return model
 end
 
-local skin_loads = {}
 local skin_messages = {Gun = "", Knife = ""}
 local catalog_ids = {Gun = {}, Knife = {}}
 local http = game:GetService("HttpService")
 
-local function fetch_skin_model(asset_id, part_name)
-    local objects = game:GetObjects("rbxassetid://" .. tostring(asset_id))
-    local model
-    for _, object in ipairs(objects) do
-        if not model then
-            local handle
-            if part_name then handle = object:FindFirstChild(part_name, true)
-            else handle = object:IsA("BasePart") and object or object:FindFirstChild("Handle", true) or object:FindFirstChildWhichIsA("BasePart", true) end
-            if handle and handle:IsA("BasePart") then
-                -- Copy only render geometry from external models, never scripts or constraints.
-                local tool = handle:FindFirstAncestorOfClass("Tool")
-                local grip = tool and tool.Grip
-                local visual = handle:Clone()
-                for _, child in ipairs(visual:GetChildren()) do
-                    if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance") or child:IsA("Decal")) then child:Destroy()
-                    else child:ClearAllChildren() end
-                end
-                model = clean_visual_clone(visual)
-                visual:Destroy()
-                local mount = handle:FindFirstChild("RightGripAttachment") or handle:FindFirstChild("CustomAttachment")
-                if model then
-                    if mount and mount:IsA("Attachment") then model:SetAttribute("Mount", mount.CFrame)
-                    elseif grip then model:SetAttribute("Mount", grip) end
-                end
-            end
-        end
-        object:Destroy()
-    end
-    return model
-end
-
-local function store_asset(name, kind)
-    local featured = {Harvester = 8211918819, Icepiercer = 13099349178, Candy = 7145570052, Luger = 12934634944, Fade = 288315111}
-    if featured[name] then
-        local loaded, model = pcall(fetch_skin_model, featured[name])
-        if loaded and model then return model end
-    end
-    local pack_names = {
-        "Clockwork","Ice Shard","Blaster","Flames","Eternal III","Chroma Boneblade","Boneblade","Purple Seer","Blue Seer","Seer","Yellow Seer","Red Seer","Gemstone","BattleAxe II","Chroma Gingerblade","Ginger Luger","Eternal II","Winter's Edge","Xmas","BattleAxe","Hallow's Blade","Pumpking","Fang","Frostsaber","Eternal","Orange Seer","Shark","Hallow's Edge","Red Luger","Hand Saw","Chill","Candy","Heat","Snowflake","Tides","Pixel","Gingerblade","Black Seer","Deathshard","Saw","Laser","Virtual","Ice Dragon","Slasher","Spider","Sugar","Old Glory","Luger","Nightblade","Green Luger"
-    }
-    local normalized = name:lower():gsub("[^%w]", "")
-    for _, part_name in ipairs(pack_names) do
-        if part_name:lower():gsub("[^%w]", "") == normalized then
-            local ok, model = pcall(fetch_skin_model, 10993357771, part_name)
-            if ok and model then return model end
-            break
-        end
-    end
-    local query = http:UrlEncode("MM2 " .. name)
-    local url = "https://apis.roblox.com/toolbox-service/v1/"
-    local results = http:JSONDecode(game:HttpGet(url .. "marketplace/10?limit=10&keyword=" .. query))
-    local ids = {}
-    for _, row in ipairs(results.data or {}) do table.insert(ids, tostring(row.id)) end
-    if #ids == 0 then return end
-    local details = http:JSONDecode(game:HttpGet(url .. "items/details?assetIds=" .. table.concat(ids, ",")))
-    local function normalize(title)
-        local words = {}
-        for token in title:lower():gsub("murder mystery 2", " "):gsub("mm2", " "):gmatch("[%w]+") do
-            if token ~= "from" and token ~= "godly" and token ~= "tool" and token ~= "working" then table.insert(words, token) end
-        end
-        return table.concat(words)
-    end
-    local wanted = normalize(name)
-    for _, row in ipairs(details.data or {}) do
-        local asset = row.asset
-        local title = normalize(asset.name)
-        if (asset.name:lower():find("mm2", 1, true) or asset.name:lower():find("murder mystery 2", 1, true)) and row.fiatProduct and row.fiatProduct.purchasable and row.fiatProduct.purchasable.isFree
-            and (title == wanted or title == wanted .. kind:lower()) then
-            local loaded, model = pcall(fetch_skin_model, asset.id)
-            if loaded and model then return model end
-        end
-    end
-    return nil
-end
-
-local function request_skin(kind, selection)
-    local key = kind .. "/" .. selection
-    local retry = skin_loads[key]
-    if retry and os.clock() < retry then return end
-    skin_loads[key] = math.huge
-    skin_messages[kind] = selection .. " — loading"
-    task.spawn(function()
-        local id = catalog_ids[kind][selection] or selection
-        local item = (Sync.Weapons or Sync.Item)[id]
-        local ok, model = pcall(function()
-            if not item then return end
-            local success, official = pcall(fetch_skin_model, item.ItemID)
-            if success and official then return official end
-            local name = item.ItemName or id
-            if item.Chroma and not name:lower():find("chroma", 1, true) then name = "Chroma " .. name end
-            return store_asset(name, kind)
-        end)
-        if not app.alive then if ok and model then model:Destroy() end; return end
-        if ok and model then
-            if skin_templates[kind][id] then model:Destroy() else skin_templates[kind][id] = model end
-        end
-        skin_loads[key] = os.clock() + 45
-        if app.settings[kind == "Gun" and "gun_skin" or "knife_skin"] == selection then
-            skin_messages[kind] = skin_templates[kind][id] and "" or (selection .. " — 3D model unavailable")
-        end
-    end)
-end
-
-
 function app.refresh_skin_catalog(force)
+    local changed = false
     for _, player in ipairs(Players:GetPlayers()) do
         local character = player.Character
         for _, kind in ipairs({"Knife", "Gun"}) do
             local ref = character and character:FindFirstChild("DisplayRef" .. kind)
             local source = ref and ref:IsA("ObjectValue") and ref.Value
             local id = player:GetAttribute("Equipped" .. kind)
+            local tool = character and character:FindFirstChild(kind)
+            if not tool and player == local_player then tool = local_player.Backpack:FindFirstChild(kind) end
+            if tool and tool:IsA("Tool") then
+                native_grips[kind] = tool.Grip
+                if skin_templates[kind][id] then skin_templates[kind][id]:SetAttribute("HandMount", tool.Grip) end
+            end
             if source and type(id) == "string" and not skin_templates[kind][id] then
                 local clone = clean_visual_clone(source)
-                if clone then skin_templates[kind][id] = clone end
+                if clone then
+                    if clone:GetAttribute("NativeDisplay") then
+                        skin_templates[kind][id] = clone
+                        if tool and tool:IsA("Tool") then clone:SetAttribute("HandMount", tool.Grip) end
+                        changed = true
+                    else clone:Destroy() end
+                end
             end
         end
     end
     if force == true then
-        table.clear(skin_loads)
         app.skin_catalog = nil
     end
-    if app.skin_catalog then return app.skin_catalog end
+    if app.skin_catalog and not changed then return app.skin_catalog end
+    if changed then app.skin_revision += 1 end
     local options = {Knife = {"Original"}, Gun = {"Original"}}
     local weapons = Sync.Weapons or Sync.Item or {}
     local counts = {Knife = {}, Gun = {}}
@@ -1306,7 +1226,7 @@ function app.refresh_skin_catalog(force)
         table.clear(catalog_ids[kind])
         local labels = {}
         for id, item in pairs(weapons) do
-            if type(item) == "table" and item.ItemType == kind then
+            if type(item) == "table" and item.ItemType == kind and skin_templates[kind][id] and skin_templates[kind][id]:GetAttribute("NativeDisplay") then
                 local name = tostring(item.ItemName or id)
                 local label = (counts[kind][name] > 1 or name == "Original") and (name .. " [" .. tostring(id) .. "]") or name
                 catalog_ids[kind][label] = id
@@ -1372,20 +1292,25 @@ local function update_skin(kind)
     end
     local part = target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart", true)
     if not part then clear_skin(kind); return end
-    local selection = app.settings[kind == "Knife" and "knife_skin" or "gun_skin"] or "Original"
+    local selection_key = kind == "Knife" and "knife_skin" or "gun_skin"
+    local selection = app.settings[selection_key] or "Original"
+    if selection ~= "Original" and not table.find(app.skin_catalog[kind], selection) then
+        selection = "Original"
+        app.settings[selection_key] = selection
+    end
     if selection == "Original" and app.settings.skin_style == "Original" and app.settings.skin_effect == "None" then
         clear_skin(kind)
         skin_messages[kind] = "Original"
         return
     end
-    local stamp = selection .. app.settings.skin_style .. app.settings.skin_effect .. tostring(app.settings.skin_color)
+    local stamp = tostring(app.skin_revision) .. selection .. app.settings.skin_style .. app.settings.skin_effect .. tostring(app.settings.skin_color)
     local overlay = skin_overlays[kind]
     if not overlay or overlay.target ~= target or overlay.stamp ~= stamp then
         if overlay then clear_skin(kind) end
         local template = skin_templates[kind][catalog_ids[kind][selection] or selection]
         if selection ~= "Original" and not template then
-            request_skin(kind, selection)
-            app.skin_status = kind .. ": " .. skin_messages[kind]
+            app.settings[selection_key] = "Original"
+            app.skin_status = kind .. ": Original"
             return
         end
         local model = template and template:Clone() or clean_visual_clone(target)
@@ -1433,11 +1358,23 @@ local function update_skin(kind)
                 end
             end
         end
-        local correction = target_mount * (model:GetAttribute("Mount") or CFrame.identity):Inverse()
-        overlay = {model = model, target = target, stamp = stamp, correction = correction}
+        local hand_mount = model:GetAttribute("HandMount") or native_grips[kind] or target_mount
+        local correction = target_mount * hand_mount:Inverse()
+        local body = rigid and (rigid.Attachment0 and rigid.Attachment0.Parent)
+        if body and body:IsDescendantOf(target) then body = rigid.Attachment1 and rigid.Attachment1.Parent end
+        local belt_offset
+        if body and body:IsA("BasePart") and model:GetAttribute("NativeDisplay") then
+            belt_offset = CFrame.new(model:GetAttribute("BeltPosition") * body.Size)
+                * model:GetAttribute("BeltRotation") * model:GetAttribute("BeltMount"):Inverse()
+        end
+        overlay = {model = model, target = target, stamp = stamp, correction = correction, body = body, belt_offset = belt_offset}
         skin_overlays[kind] = overlay
     end
-    overlay.model:PivotTo(part.CFrame * overlay.correction)
+    if overlay.belt_offset and overlay.body and overlay.body.Parent then
+        overlay.model:PivotTo(overlay.body.CFrame * overlay.belt_offset)
+    else
+        overlay.model:PivotTo(part.CFrame * overlay.correction)
+    end
     for object, record in pairs(skin_hidden[kind]) do
         if object.Parent then object[record.key] = record.key == "LocalTransparencyModifier" and 1 or false end
     end
@@ -1468,8 +1405,35 @@ function app.cleanup_extras()
     table.clear(rainbow_originals)
 end
 
+local cinematic_originals = {}
+function app.update_cinematic()
+    local camera = workspace.CurrentCamera
+    local lighting = game:GetService("Lighting")
+    local function apply(object, key, enabled, value)
+        local record = cinematic_originals[object]
+        if enabled then
+            if not record then record = {}; cinematic_originals[object] = record end
+            if record[key] == nil then record[key] = object[key] end
+            object[key] = value
+        elseif record and record[key] ~= nil then
+            object[key] = record[key]
+            record[key] = nil
+        end
+    end
+    if camera then apply(camera, "FieldOfView", app.settings.cinematic_fov, app.settings.camera_fov) end
+    apply(lighting, "Brightness", app.settings.fullbright, 3)
+    apply(lighting, "Ambient", app.settings.fullbright, Color3.fromRGB(220,220,220))
+    apply(lighting, "GlobalShadows", app.settings.fullbright, false)
+end
+function app.reset_cinematic()
+    for object, record in pairs(cinematic_originals) do
+        if object.Parent then for key, value in pairs(record) do object[key] = value end end
+    end
+    table.clear(cinematic_originals)
+end
 local extras_elapsed = 0
 function app.extra_render(dt)
+    app.update_cinematic()
     local character, root, humanoid = character_parts(local_player)
     local camera = workspace.CurrentCamera
     local target = target_player()
@@ -1783,7 +1747,7 @@ local translations = {pt = {
     ["Round"]="Ronda",["Clips"]="Clipes",["Health bar"]="Barra de vida",["Streamer mode"]="Modo streamer",
     ["Choose a gun"]="Escolher pistola",["Choose a knife"]="Escolher faca",["Bomb double jump"]="Salto duplo com bomba",
     ["Spin and shoot"]="Girar e disparar",["Cancel clip"]="Cancelar clipe",["Rotation speed"]="Velocidade do giro",
-    ["Full catalog. Search and choose a thumbnail to apply its local model."]="Escolhe uma miniatura para aplicar o modelo local.",
+    ["Only loaded models appear. Refresh to discover newly replicated skins."]="Apenas modelos carregados. Atualiza para encontrar novas skins disponíveis.",
     ["Skeleton"]="Esqueleto", ["Trigger bot"]="Disparo ao passar a mira", ["Kill all as Murderer"]="Eliminar todos como Murderer", ["Murderer role required"]="É preciso ser o Murderer",
     ["UI library"]="Biblioteca da interface", ["Gun A–Z"]="Pistolas A–Z", ["Knife A–Z"]="Facas A–Z",
     ["Local skins"] = "Skins locais", ["Target player"] = "Jogador alvo", ["Refresh players"] = "Atualizar jogadores",
@@ -1802,6 +1766,7 @@ local translations = {pt = {
     ["Missing APIs"] = "APIs em falta", ["All required APIs available"] = "Todas as APIs necessarias disponiveis",
     ["Unavailable feature"] = "Funcao indisponivel", ["Disabled modules"] = "Modulos indisponiveis",
     ["Disables idle callbacks without clicking or activating weapons."] = "Desativa callbacks de inatividade sem clicar nem ativar armas.",
+    ["Custom camera FOV"]="Campo de visão da câmara", ["Camera FOV"]="Ângulo da câmara", ["Fullbright"]="Iluminação clara",
     ["Aimbot"]="Mira", ["Farm"]="Farm", ["Skins"]="Aparências", ["Visuals"] = "Visuais", ["Movement"] = "Movimento", ["Boxes"] = "Caixas", ["Settings"] = "Configuracoes", ["About"] = "Sobre",
     ["Account age"] = "Dias da conta", ["Executor"] = "Executor", ["Load time"] = "Carregamento", ["Session XP"] = "XP da sessao",
     ["Role ESP"] = "ESP por papel", ["Player names"] = "Nomes dos jogadores", ["Role labels"] = "Mostrar papeis",
@@ -1856,6 +1821,7 @@ local function tr(text)
 end
 app.translate = tr
 function app.open_gallery(kind)
+    app.refresh_skin_catalog()
     if app.gallery then app.gallery:Destroy() end
     local layer=Instance.new("Frame")
     layer.Name="SkinGallery"
@@ -1901,7 +1867,7 @@ function app.open_gallery(kind)
     close.Activated:Connect(function() layer:Destroy();app.gallery=nil end)
     local search=Instance.new("TextBox")
     search.Name="Search"
-    search.PlaceholderText=app.settings.language=="Portuguese" and "Pesquisar skins" or "Search skins"
+    search.PlaceholderText=app.settings.locale=="pt" and "Pesquisar skins" or "Search skins"
     search.Text=""
     search.ClearTextOnFocus=false
     search.Size=UDim2.new(1,-24,0,30)
@@ -1957,7 +1923,9 @@ function app.open_gallery(kind)
         tile.LayoutOrder=name=="Original" and 0 or i
         tile.BackgroundColor3=app.settings[key]==name and Color3.fromRGB(43,79,116) or Color3.fromRGB(39,45,62)
         tile.ScaleType=Enum.ScaleType.Fit
-        tile.Image=item and (tostring(item.Image or ""):match("^rbxassetid://%d+") or ("rbxthumb://type=Asset&id="..tostring(item.ItemID).."&w=150&h=150")) or ""
+        local image = item and tostring(item.Image or "") or ""
+        local image_id = image:match("[?&]assetId=(%d+)") or image:match("[?&]id=(%d+)")
+        tile.Image = image:match("^rbxassetid://%d+") or (item and ("rbxthumb://type=Asset&id=" .. tostring(image_id or item.ItemID) .. "&w=150&h=150")) or ""
         tile.ZIndex=13
         tile.Parent=scroll
         Instance.new("UICorner",tile).CornerRadius=UDim.new(0,8)
@@ -2280,6 +2248,9 @@ local function build_ui()
         app.finish_active, app.forced_target, app.pickup_requested = false, nil, false; app.restore_movement()
     end})
     local clips=tabs.Clips
+    toggle(clips, "cinematic_fov", "Custom camera FOV")
+    slider(clips, "camera_fov", "Camera FOV", 40, 120, 1)
+    toggle(clips, "fullbright", "Fullbright")
     local function clip_button(title, action)
         clips:CreateButton({name=title,callback=function()
             local ok,reason=action()
@@ -2343,7 +2314,7 @@ local function build_ui()
         callback = function(color) app.settings.skin_color = color end})
     skins:CreateButton({name = "Refresh skin catalog", callback = function() app.refresh_skin_catalog(true) end})
     skins:CreateButton({name = "Restore original visuals", callback = function() set_enabled("skins", false) end})
-    skins:CreateText({text = "Full catalog. Search and choose a thumbnail to apply its local model."})
+    skins:CreateText({text = "Only loaded models appear. Refresh to discover newly replicated skins."})
     app.skin_text = skins:CreateText({name = "Status", text = "Original"})
 
     local boxes = tabs.Boxes
