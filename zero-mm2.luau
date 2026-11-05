@@ -18,6 +18,8 @@ local client_services = assert(ReplicatedStorage:WaitForChild("ClientServices", 
 
 local env = type(getgenv) == "function" and getgenv() or _G
 if env.ZERO_MM2 and env.ZERO_MM2.destroy then env.ZERO_MM2.destroy() end
+local source_ref = env.ZERO_MM2_SOURCE_REF
+if type(source_ref) ~= "string" or #source_ref ~= 40 or not source_ref:match("^[a-f0-9]+$") then source_ref = "main" end
 local reload_state = env.__ZERO_RELOAD_STATE
 env.__ZERO_RELOAD_STATE = nil
 local app: any = {
@@ -1411,7 +1413,7 @@ function app.load_skin_library()
         if ok and type(text) == "string" then apply_payload(text) end
     end
     local fetched, public = pcall(function()
-        return game:HttpGet("https://raw.githubusercontent.com/nandox97l/zero-mm2/main/skins.json")
+        return game:HttpGet("https://raw.githubusercontent.com/nandox97l/zero-mm2/" .. source_ref .. "/skins.json")
     end)
     if fetched and type(public) == "string" then apply_payload(public) end
 end
